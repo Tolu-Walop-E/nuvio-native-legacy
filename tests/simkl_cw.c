@@ -47,7 +47,8 @@ int trakt_enfeitar_lote(CatItem *saida, int n) { (void)saida; return n; }
 // ---------------------------------------------------------------- rede falsa
 
 // Resposta de /sync/playback copiada do exemplo da doc, mais um anime com
-// numeracao TVDB, um anime SO com AniDB (tem de sair) e um item sem imdb.
+// numeracao TVDB, um anime SO com AniDB (tem de sair), um item sem imdb e um
+// filme NOVO no fim: /sync/playback nao promete vir ordenado.
 static const char *PLAYBACK =
   "[{\"id\":123,\"progress\":45.5,\"paused_at\":\"2024-01-15T10:30:00.000Z\","
   "\"type\":\"episode\",\"episode\":{\"season\":1,\"episode\":5,\"title\":\"Episode 5\","
@@ -63,7 +64,9 @@ static const char *PLAYBACK =
   "\"episode\":{\"season\":1,\"number\":7},"
   "\"anime\":{\"title\":\"So AniDB\",\"ids\":{\"mal\":1,\"imdb\":\"tt0000001\"}}},"
   "{\"id\":127,\"progress\":50,\"paused_at\":\"2024-01-12T09:00:00Z\",\"type\":\"movie\","
-  "\"movie\":{\"title\":\"Sem imdb\",\"ids\":{\"simkl\":1}}}]";
+  "\"movie\":{\"title\":\"Sem imdb\",\"ids\":{\"simkl\":1}}},"
+  "{\"id\":128,\"progress\":25,\"paused_at\":\"2024-01-22T09:00:00Z\",\"type\":\"movie\","
+  "\"movie\":{\"title\":\"Novo no fim\",\"year\":2024,\"ids\":{\"imdb\":\"tt9999998\"}}}]";
 
 // /sync/all-items/shows/watching: Breaking Bad (ja pausado — nao pode entrar
 // duas vezes), uma serie com proximo episodio mais nova que tudo, uma em dia
@@ -196,7 +199,7 @@ static void leitores(void) {
   CatItem v[12];
   long long ids[12];
   int n = simkl_ler_playback(PLAYBACK, v, ids, 12);
-  assert(n == 3);   // anime so-AniDB e item sem imdb ficam fora
+  assert(n == 4);   // anime so-AniDB e item sem imdb ficam fora
   assert(!strcmp(v[0].imdb, "tt0903747:1:5") && !strcmp(v[0].tipo, "series"));
   assert(v[0].temporada == 1 && v[0].episodio == 5 && v[0].progresso == 45);
   assert(!strcmp(v[0].titulo, "Breaking Bad") && !strcmp(v[0].nomeEpisodio, "Episode 5"));
@@ -206,6 +209,7 @@ static void leitores(void) {
   assert(v[1].retomadoMs > v[0].retomadoMs);   // 11:15 depois de 10:30
   // Anime: numeracao TVDB (2x3), nao a do AniDB (1x40).
   assert(!strcmp(v[2].imdb, "tt2560140:2:3") && ids[2] == 125);
+  assert(!strcmp(v[3].imdb, "tt9999998") && ids[3] == 128);
   OK("playback: serie, filme e anime (TVDB) viram itens; AniDB puro e sem imdb ficam fora");
 
   n = simkl_ler_assistindo(WATCHING, v, 12);
@@ -230,13 +234,14 @@ static void retomada(void) {
   int n, i;
   memset(batidas, 0, sizeof batidas);
   n = simkl_continuar(v, 12);
-  // 3 pausados + Severance (a seguir). Breaking Bad do watching NAO entra de
+  // 4 pausados + Severance (a seguir). Breaking Bad do watching NAO entra de
   // novo: a serie ja esta pausada no S01E05.
-  assert(n == 4);
+  assert(n == 5);
   for (i = 0; i < n; i++) assert(strncmp(v[i].imdb, "tt0903747:1:6", 13));
-  // Mais recente primeiro: Severance (20/01) antes de Inception (15/01 11:15).
-  assert(!strcmp(v[0].imdb, "tt11280740:2:3"));
-  assert(!strcmp(v[1].imdb, "tt1375666"));
+  // Mais recente primeiro, inclusive quando o mais novo veio no FIM do JSON.
+  assert(!strcmp(v[0].imdb, "tt9999998"));
+  assert(!strcmp(v[1].imdb, "tt11280740:2:3"));
+  assert(!strcmp(v[2].imdb, "tt1375666"));
   assert(simkl_e_a_seguir("tt11280740:2:3"));
   assert(!simkl_e_a_seguir("tt1375666"));
   assert(batidas[0] == 1 && batidas[1] == 1 && batidas[2] == 1);
@@ -245,16 +250,17 @@ static void retomada(void) {
 
   // Atividades iguais: nada de playback nem all-items de novo.
   n = simkl_continuar(v, 12);
-  assert(n == 4 && batidas[0] == 2 && batidas[1] == 1 && batidas[2] == 1);
+  assert(n == 5 && batidas[0] == 2 && batidas[1] == 1 && batidas[2] == 1);
   // Atividade nova: rebaixa.
   snprintf(atividades, sizeof atividades, "{\"all\":\"2024-01-21T00:00:00Z\"}");
   n = simkl_continuar(v, 12);
-  assert(n == 4 && batidas[0] == 3 && batidas[1] == 2 && batidas[2] == 2);
+  assert(n == 5 && batidas[0] == 3 && batidas[1] == 2 && batidas[2] == 2);
   OK("retomada: /sync/activities igual nao baixa all-items de novo");
 
   // Lista cheia: o "a seguir" mais novo toma o lugar do pausado mais velho.
   n = simkl_continuar(v, 3);
-  assert(n == 3 && !strcmp(v[0].imdb, "tt11280740:2:3"));
+  assert(n == 3 && !strcmp(v[0].imdb, "tt9999998"));
+  assert(!strcmp(v[1].imdb, "tt11280740:2:3"));
   for (i = 0; i < n; i++) assert(strcmp(v[i].imdb, "tt2560140:2:3"));   // o de 14/01 saiu
   OK("retomada: com a fileira cheia, o a seguir mais novo substitui o mais velho");
 

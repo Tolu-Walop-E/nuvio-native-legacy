@@ -2696,7 +2696,7 @@ static int recuarPelaDesmarcacao(const char *serie, int *t, int *e, long long re
 }
 // Os ids que ele moveu nesta montagem; montarContinuar os publica (cwordem.c)
 // antes de perguntar quem e "a seguir".
-static char ajustadosIds[CONT_MAX * 3][sizeof(((CatItem *)0)->imdb)];
+static char ajustadosIds[CONT_MAX * 2 + SIMKL_CONTINUAR_MAX][sizeof(((CatItem *)0)->imdb)];
 static int nAjustados;
 static void ajustarASeguir(CatItem *it) {
   char serie[sizeof it->imdb], velho[sizeof it->imdb];
@@ -2922,13 +2922,14 @@ static int montarContinuar(CatItem *saida, int max) {
   // static: dois lotes de 12 CatItem passam de 350 KB e montar() roda uma vez,
   // num fio so — a mesma razao do vetor de Decl mais abaixo.
   static CatItem doTrakt[CONT_MAX], daConta[CONT_MAX];
-  // Tres fontes: conta, Trakt e Simkl, cada uma com ate CONT_MAX.
-  static Cand juntos[CONT_MAX * 3];
+  // Tres fontes: conta e Trakt com ate CONT_MAX; Simkl traz uma reserva maior
+  // para o filtro e o corte acontecerem somente depois da mistura.
+  static Cand juntos[CONT_MAX * 2 + SIMKL_CONTINUAR_MAX];
   // Os REMOTOS numa lista so (Trakt e Simkl), por ponteiro. E ela que a conta
   // enfrenta abaixo: para a regra "a mesma obra entra uma vez, a mais recente
   // ganha", Trakt e Simkl sao a mesma pergunta feita a dois servicos.
-  static CatItem *remotos[CONT_MAX * 2];
-  // O lote do Simkl vai no HEAP e so quando e pedido: 12 CatItem sao ~190 KB,
+  static CatItem *remotos[CONT_MAX + SIMKL_CONTINUAR_MAX];
+  // O lote do Simkl vai no HEAP e so quando e pedido: 64 CatItem sao ~1 MB,
   // e na Samsung (teto de 128 MiB do WebAssembly) nao se paga isso em BSS para
   // quem nunca vinculou o Simkl.
   CatItem *doSimkl = NULL;
@@ -2957,9 +2958,9 @@ static int montarContinuar(CatItem *saida, int max) {
   // titulos praticamente terminados, que e o "nunca assisti isso" do relato.
   nT = filtrarRemoto(doTrakt, nT, trakt_e_a_seguir, &fora);
   if (querSimkl) {
-    doSimkl = (CatItem *)malloc(sizeof(CatItem) * CONT_MAX);
+    doSimkl = (CatItem *)malloc(sizeof(CatItem) * SIMKL_CONTINUAR_MAX);
     if (doSimkl) {
-      nS = simkl_continuar(doSimkl, CONT_MAX);
+      nS = simkl_continuar(doSimkl, SIMKL_CONTINUAR_MAX);
       nS = filtrarRemoto(doSimkl, nS, simkl_e_a_seguir, &fora);
     }
   }
@@ -3000,7 +3001,7 @@ static int montarContinuar(CatItem *saida, int max) {
 
   // Os "a seguir" que a desmarcacao moveu (Trakt/Simkl acima; a conta, que ja
   // foi montada em contaASeguir, entra pelo seu proprio registro e pelo id novo).
-  { const char *aj[CONT_MAX * 3];
+  { const char *aj[CONT_MAX * 2 + SIMKL_CONTINUAR_MAX];
     int k;
     for (k = 0; k < nAjustados; k++) aj[k] = ajustadosIds[k];
     cwo_ajustados_definir(aj, nAjustados); }
@@ -3099,10 +3100,10 @@ static int montarContinuar(CatItem *saida, int max) {
   // "Proximos episodios" com eles. `showUnairedNextUp` desligado os tira de vez
   // (shouldShowNextUpEpisodeForContinueWatching do web): antes esta preferencia
   // tambem nao era lida por ninguem.
-  { static CwoItem cwo[CONT_MAX * 3];
-    static Cand ordenados[CONT_MAX * 3];
-    static int perm[CONT_MAX * 3];
-    static const char *futIds[CONT_MAX * 3];
+  { static CwoItem cwo[CONT_MAX * 2 + SIMKL_CONTINUAR_MAX];
+    static Cand ordenados[CONT_MAX * 2 + SIMKL_CONTINUAR_MAX];
+    static int perm[CONT_MAX * 2 + SIMKL_CONTINUAR_MAX];
+    static const char *futIds[CONT_MAX * 2 + SIMKL_CONTINUAR_MAX];
     long long agora = (long long)time(NULL) * 1000LL;
     int modo = ajustes_cw_ordem(), naoExibidos = ajustes_cw_mostrar_nao_exibidos();
     int proxFora = 0, escondidos = 0, semData = 0, principal, nFut = 0, mp, mf, w = 0;
@@ -3208,6 +3209,9 @@ static int montarContinuar(CatItem *saida, int max) {
              : doSimkl && juntos[i].item >= doSimkl && juntos[i].item < doSimkl + CONT_MAX ? "simkl"
              : "trakt");
   }
+  // O Simkl entrega uma reserva grande e crua para que filtro/ordem/corte
+  // sejam corretos. So os vencedores pagam arte, sinopse e duracao.
+  nJ = trakt_enfeitar_lote(saida, nJ);
   // O que ja foi localizado antes entra AQUI, sem rede: a fileira nao pisca em
   // ingles a cada refazagem. O que falta e buscado depois de publicada
   // (localizarContinuarPublicado), para o texto novo nunca atrasar a fileira.

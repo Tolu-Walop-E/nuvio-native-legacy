@@ -17,7 +17,7 @@
 #define SMK_API "https://api.simkl.com"
 // Retomada: o mesmo teto da fileira (CONT_MAX de descoberta.c) com folga para
 // o "a seguir" disputar lugar com os pausados.
-#define SMK_PLAY_MAX 64
+#define SMK_PLAY_MAX SIMKL_CONTINUAR_MAX
 // Plan to Watch conhecido, para a guarda do "-". 400 ids x 24 B = ~10 KB; a
 // lista de "quero ver" de uma pessoa real cabe com sobra.
 #define SMK_PTW_MAX 400
@@ -102,24 +102,20 @@ static int lerObra(const char *oi, const char *of, CatItem *d, char *imdb,
 
 // ------------------------------------------------------------ leitores puros
 
-int simkl_ler_playback(const char *json, CatItem *dst, long long *ids, int max) {
-  const char *p;
-  int n = 0;
-  if (!json || !dst) return 0;
-  for (p = js_raiz_array(json); p && *p == '{' && n < max; p = js_prox(js_fim(p))) {
-    const char *f = js_fim(p), *oi, *of, *ei = NULL, *ef = NULL, *vi, *vf;
-    CatItem *d = &dst[n];
+static int lerPlaybackItem(const char *p, const char *f, CatItem *d,
+                           long long *id) {
+    const char *oi, *of, *ei = NULL, *ef = NULL, *vi, *vf;
     char imdb[24], quando[40] = "";
     int serie = 0, anime = 0;
     memset(d, 0, sizeof *d);
     if (objetoRaiz(p, f, "movie", &oi, &of)) serie = 0;
     else if (objetoRaiz(p, f, "show", &oi, &of)) serie = 1;
     else if (objetoRaiz(p, f, "anime", &oi, &of)) serie = anime = 1;
-    else continue;
-    if (!lerObra(oi, of, d, imdb, sizeof imdb)) continue;
+    else return 0;
+    if (!lerObra(oi, of, d, imdb, sizeof imdb)) return 0;
     if (serie) {
       int t = 0, e = 0;
-      if (!objetoRaiz(p, f, "episode", &ei, &ef)) continue;
+      if (!objetoRaiz(p, f, "episode", &ei, &ef)) return 0;
       // ANIME SO COM A NUMERACAO DO TVDB. A doc: "Anime episodes return both
       // AniDB episode numbers (season, number) and TVDB numbers (tvdb_season,
       // tvdb_number)". O resto do app fala TVDB; o AniDB poria o card no
@@ -131,7 +127,7 @@ int simkl_ler_playback(const char *json, CatItem *dst, long long *ids, int max) 
         e = (int)js_num(ei, ef, "episode", 0.0);
         if (e <= 0) e = (int)js_num(ei, ef, "number", 0.0);
       }
-      if (t <= 0 || e <= 0) continue;
+      if (t <= 0 || e <= 0) return 0;
       d->temporada = t;
       d->episodio = e;
       js_texto_raiz_em(ei, ef, "title", d->nomeEpisodio, sizeof d->nomeEpisodio);
@@ -146,13 +142,53 @@ int simkl_ler_playback(const char *json, CatItem *dst, long long *ids, int max) 
     if (valorRaiz(p, f, "progress", &vi, &vf)) d->progresso = (int)atof(vi);
     if (js_texto_raiz_em(p, f, "paused_at", quando, sizeof quando))
       d->retomadoMs = js_ms_iso(quando);
-    if (ids) {
+    if (id) {
       // O "id" da RAIZ e o do registro de playback — o que DELETE
       // /sync/playback/{id} pede. "64bit integer" na doc: atof guarda inteiro
       // exato ate 2^53, e o id do Simkl esta longe disso.
-      ids[n] = valorRaiz(p, f, "id", &vi, &vf) ? (long long)atof(vi) : 0;
+      *id = valorRaiz(p, f, "id", &vi, &vf) ? (long long)atof(vi) : 0;
     }
+    return 1;
+}
+
+int simkl_ler_playback(const char *json, CatItem *dst, long long *ids, int max) {
+  const char *p;
+  int n = 0;
+  if (!json || !dst) return 0;
+  for (p = js_raiz_array(json); p && *p == '{' && n < max; p = js_prox(js_fim(p))) {
+    const char *f = js_fim(p);
+    long long id = 0;
+    if (!lerPlaybackItem(p, f, &dst[n], &id)) continue;
+    if (ids) ids[n] = id;
     n++;
+  }
+  return n;
+}
+
+// /sync/playback nao promete ordem. Guarda os `max` mais recentes enquanto
+// percorre a resposta INTEIRA; assim um item novo depois da posicao 12 nao e
+// perdido antes da ordenacao da fileira.
+static int lerPlaybackRecentes(const char *json, CatItem *dst, long long *ids,
+                               int max) {
+  const char *p;
+  int n = 0;
+  if (!json || !dst || max <= 0) return 0;
+  for (p = js_raiz_array(json); p && *p == '{'; p = js_prox(js_fim(p))) {
+    const char *f = js_fim(p);
+    CatItem item;
+    long long id = 0;
+    int alvo;
+    if (!lerPlaybackItem(p, f, &item, &id)) continue;
+    if (n < max) alvo = n++;
+    else {
+      int i, velho = 0;
+      for (i = 1; i < n; i++)
+        if (dst[i].retomadoMs < dst[velho].retomadoMs) velho = i;
+      if (item.retomadoMs <= dst[velho].retomadoMs) continue;
+      alvo = velho;
+    }
+    dst[alvo] = item;
+    if (ids) ids[alvo] = id;
   }
   return n;
 }
@@ -483,7 +519,7 @@ int simkl_continuar(CatItem *saida, int max) {
     printf("[simkl] retomada: atividades iguais, corpos guardados\n");
   }
 
-  n = simkl_ler_playback(cPlay, saida, ids, max);
+  n = lerPlaybackRecentes(cPlay, saida, ids, max);
   pthread_mutex_lock(&trava);
   nPlay = 0;
   for (i = 0; i < n; i++)
@@ -532,10 +568,10 @@ int simkl_continuar(CatItem *saida, int max) {
   printf("[simkl] retomada: %d pausado(s) + %d a seguir candidato(s) -> %d\n",
          nPlay, nP, n);
   fflush(stdout);
-  // Arte por metahub, sinopse e minutos pelo Cinemeta — o mesmo acabamento
-  // dos itens do Trakt e da conta. Chamado sob a trava de montarContinuar,
-  // que e quem protege os buffers de trakt_enfeitar_lote.
-  return n ? trakt_enfeitar_lote(saida, n) : 0;
+  // A arte e o texto sao buscados por montarContinuar SOMENTE depois do corte
+  // visivel. Enfeitar os 64 candidatos aqui faria dezenas de GETs para itens
+  // que nunca chegam a fileira.
+  return n;
 }
 
 int simkl_plantowatch(CatItem *saida, int max) {

@@ -90,7 +90,14 @@ const char *simkl_rota_lista(int adicionar);
 
 // --- leituras de rede: BLOQUEIAM, so do fio de descoberta ---------------------
 
-// Pausados + "a seguir", mais recente primeiro, ja com arte. Devolve 0 sem
+// O produtor entrega candidatos suficientes para o consumidor filtrar,
+// deduplicar e so entao cortar a fileira visivel (12). Cortar na leitura fazia
+// dois itens rejeitados deixarem buracos mesmo havendo dezenas de candidatos.
+#define SIMKL_CONTINUAR_MAX 64
+
+// Pausados + "a seguir", mais recente primeiro. O consumidor enfeita somente
+// os vencedores depois do corte, evitando rede para dezenas de descartados.
+// Devolve 0 sem
 // vinculo. Pula a rede quando /sync/activities responde igual a ultima vez
 // (a doc manda nao baixar all-items "on a timer").
 int simkl_continuar(CatItem *saida, int max);
