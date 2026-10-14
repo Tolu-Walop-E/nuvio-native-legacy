@@ -143,6 +143,7 @@ object NvPlayer {
     // --- natives (src/video_android.c, Java_space_nuvio_nativelegacy_NvPlayer_*) ---
     @JvmStatic external fun nativeIniciar()
     @JvmStatic external fun nativeEvento(tipo: Int, a: Int, b: Int)
+    @JvmStatic external fun nativeHostFalhou(host: String)
     // flags (#287): 1 = forcada (SELECTION_FLAG_FORCED), 2 = SDH
     // (ROLE_FLAG_DESCRIBES_MUSIC_AND_SOUND); nome = Format.label.
     // mime/canais (#293): codec e canais da faixa de audio.
@@ -963,14 +964,21 @@ object NvPlayer {
     @JvmStatic fun pausar(p: Int) { principal.post { player?.playWhenReady = (p == 0) } }
     @JvmStatic fun buscar(ms: Int) {
         val pedido = pedidos.get()
-        principal.post { if (pedido == pedidos.get()) player?.seekTo(ms.coerceAtLeast(0).toLong()) }
+        principal.post {
+            if (pedido == pedidos.get()) player?.let { p ->
+                Log.i(TAG, "[player] seek from=${p.currentPosition / 1000.0} to=${ms.coerceAtLeast(0) / 1000.0}")
+                p.seekTo(ms.coerceAtLeast(0).toLong())
+            }
+        }
     }
     @JvmStatic fun volume(pct: Int) { principal.post { player?.volume = pct.coerceIn(0, 100) / 100f } }
     // F07: cache limit for the NEXT opens (MB, 0 = off) and the session volume
     // 0..200 (above 100 only while the audio is PCM).
     // #338: buffer size preset (0 Auto, 1 Low, 2 Medium, 3 High), sticky, read at open.
     @Volatile private var bufferPreset = 0
+    @Volatile private var redeModo = 0
     @JvmStatic fun buffer(preset: Int) { bufferPreset = preset.coerceIn(0, 3) }
+    @JvmStatic fun rede(modo: Int) { redeModo = if (modo == 1) 1 else 0 }
     @JvmStatic fun cache(mb: Int) { cacheMbPedido = mb.coerceIn(0, 1024) }
     @JvmStatic fun ganho(pct: Int) {
         principal.post { ganhoPct = GanhoMath.pct(pct); aplicarGanho() }
@@ -1047,7 +1055,7 @@ object NvPlayer {
                 r.cache = c; r.cacheEstado = estado
             }
             r.rede = { token ->
-                val rede = ParaleloDataSource.Factory(ua, props, http, medidor, token)
+                val rede = ParaleloDataSource.Factory(ua, props, http, medidor, token) { redeModo }
                 r.cache?.fabrica(rede) ?: rede
             }
             val origemPreparo = r.cache?.fabrica(http) ?: http
@@ -1791,7 +1799,13 @@ object NvPlayer {
                 principal.postDelayed({ if (atual(minha)) abrirMain(u, c, true, inicio, geracao, pedido, fracao) }, 400)
                 return
             }
-            ev(EV_ERRO, error.errorCode, tipo)
+            val redeEsgotada = generateSequence<Throwable>(error) { it.cause }
+                .take(16).filterIsInstance<FalhaDownloadParalelo>().firstOrNull()
+            if (redeEsgotada != null)
+                Log.w(TAG, "[player] network host exhausted host=${redeEsgotada.hostFinal} class=${redeEsgotada.classeRede}")
+            if (redeEsgotada != null) try { nativeHostFalhou(redeEsgotada.hostFinal) }
+                catch (e: UnsatisfiedLinkError) { Log.w(TAG, "host failure without native core: $e") }
+            ev(EV_ERRO, if (redeEsgotada != null) -20001 else error.errorCode, tipo)
         }
     }
 

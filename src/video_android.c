@@ -61,7 +61,7 @@ static jmethodID mPararMantendoPreparo;
 static unsigned preparoAdotar;
 // F07 (optional, like abrirPosicao): cache(mb) and ganho(pct). A shell without
 // them simply has no seek cache and no boost.
-static jmethodID mCache, mGanho, mBuffer;
+static jmethodID mCache, mGanho, mBuffer, mRede;
 // #202 (opcional, como os de cima): velocidade(centesimos). Casca sem ele =
 // sem a linha da velocidade.
 static jmethodID mVelocidade;
@@ -85,6 +85,8 @@ static int resolverMetodos(JNIEnv *env) {
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mCache = NULL; }
   mBuffer = (*env)->GetStaticMethodID(env, gCls, "buffer", "(I)V");
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mBuffer = NULL; }
+  mRede = (*env)->GetStaticMethodID(env, gCls, "rede", "(I)V");
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mRede = NULL; }
   mGanho = (*env)->GetStaticMethodID(env, gCls, "ganho", "(I)V");
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mGanho = NULL; }
   mVelocidade = (*env)->GetStaticMethodID(env, gCls, "velocidade", "(I)V");
@@ -345,7 +347,7 @@ static unsigned sessao;
 // F07: the player arms the next video_tocar with its cache limit
 // (cacheboost_backend_cache); trailers never arm, so they stay uncached and
 // at 100%. `cacheSessao` survives the reconnection reopens of that video.
-static int bufferPreset, bufferEnviado;
+static int bufferPreset, bufferEnviado, redeModo, redeEnviado = -1;
 static int cacheArmado = -1, cacheSessao, cacheEnviado, playerSessao;
 static int ganhoEnviado = CB_VOL_NORMAL;
 static int retomadaInicialEstado = -1;
@@ -368,6 +370,7 @@ static char erroTxt[64];
 // MEDIDO em aparelho: status HTTP (2004), 403/404 e formato quebrado ficam de
 // fora de proposito, recarregar a mesma URL so repete a recusa.
 static int erroDeRede(int cod) { return cod >= 2000 && cod <= 2002; }
+#define ERRO_HOST_ESGOTADO (-20001)
 
 void video_escolher_audio(int i);
 
@@ -635,6 +638,14 @@ JNIEXPORT void JNICALL Java_space_nuvio_nativelegacy_NvPlayer_nativeEvento(JNIEn
   if (tipo != EV_BUFFER) { printf("[video] android evento %d (%d, %d)\n", tipo, a, b); fflush(stdout); }
 }
 
+JNIEXPORT void JNICALL Java_space_nuvio_nativelegacy_NvPlayer_nativeHostFalhou(JNIEnv *env, jclass cls, jstring host) {
+  const char *h;
+  (void)cls;
+  if (!host) return;
+  h = (*env)->GetStringUTFChars(env, host, NULL);
+  if (h) { stream_host_pausar(h); (*env)->ReleaseStringUTFChars(env, host, h); }
+}
+
 // --- video.h (C -> Kotlin) -----------------------------------------------------
 int  video_iniciar(void) {
   JNIEnv *env;
@@ -672,6 +683,11 @@ static int abrirSessao(int inicioMs, int fracao) {
     (*env)->CallStaticVoidMethod(env, gCls, mBuffer, (jint)bufferPreset);
     fimChamada(env);
     bufferEnviado = bufferPreset;
+  }
+  if (mRede && redeModo != redeEnviado) {
+    (*env)->CallStaticVoidMethod(env, gCls, mRede, (jint)redeModo);
+    fimChamada(env);
+    redeEnviado = redeModo;
   }
   if (mCache && cacheSessao != cacheEnviado) {
     (*env)->CallStaticVoidMethod(env, gCls, mCache, (jint)cacheSessao);
@@ -762,6 +778,7 @@ int video_tocar_retomada(const char *u, double segundos, double pct) {
 int video_tocar_posicao(const char *u, double segundos) { return video_tocar_retomada(u, segundos, 0.0); }
 
 void cacheboost_backend_buffer(int p) { bufferPreset = p >= 0 && p <= 3 ? p : 0; }
+void cacheboost_backend_rede(int m) { redeModo = m == 1 ? 1 : 0; }
 void cacheboost_backend_cache(int mb) { cacheArmado = mb > 0 ? mb : 0; }
 void cacheboost_backend_ganho(int pct) {
   if (pct < CB_VOL_MIN) pct = CB_VOL_MIN;
@@ -799,6 +816,16 @@ void video_bombear(void) {
     int antes = recon.tentativa;
     int rede = erroDeRede(reconErroCod);
     reconErroPend = 0;
+    // O downloader ja confirmou a falha e TaxaConexao pausou o host final.
+    // Reabrir a mesma URL pelo ciclo 3/10/25 s so prolongaria a interrupcao;
+    // entregue a falha agora para o failover nativo escolher outra rota.
+    if (reconErroCod == ERRO_HOST_ESGOTADO) {
+      printf("[video] host final indisponivel; pulando reconexoes da mesma URL\n");
+      fflush(stdout);
+      falhou = 1;
+      bufferando = 0;
+      return;
+    }
     if (reconPermitida && urlAtual[0] && (reconIniciou || recon.tentativa) &&
         nv_recon_erro(&recon, rede, SDL_GetTicks(), pos)) {
       if (!antes) {

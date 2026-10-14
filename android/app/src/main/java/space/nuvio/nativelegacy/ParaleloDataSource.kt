@@ -13,6 +13,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.InterruptedIOException
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.util.Collections
 import java.util.concurrent.ExecutorService
@@ -34,9 +35,15 @@ import java.util.concurrent.TimeUnit
 // So entra para http(s) que nao seja manifesto/segmento de HLS/DASH (esses ja
 // sao pedacos pequenos) e so se o servidor honrar Range (206 com Content-Range).
 // Senao, devolve o fluxo da conexao unica, como o DefaultHttpDataSource.
-internal class FalhaDownloadParalelo(causa: IOException) : IOException(causa)
+internal class FalhaDownloadParalelo(
+    val hostFinal: String,
+    val classeRede: String,
+    causa: IOException,
+) : IOException(causa)
 
-/** Nao repete no Loader o ciclo de tentativas que este DataSource ja esgotou. */
+private class FalhaConexaoHost(val hostFalho: String, causa: IOException) : IOException(causa)
+
+/** The downloader already exhausted its bounded transport retries. */
 internal class PoliticaErroParalelo : DefaultLoadErrorHandlingPolicy() {
     override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
         var causa: Throwable? = loadErrorInfo.exception
@@ -48,7 +55,7 @@ internal class PoliticaErroParalelo : DefaultLoadErrorHandlingPolicy() {
     }
 }
 
-class ParaleloDataSource(
+internal class ParaleloDataSource(
     private val ua: String?,
     private val props: Map<String, String>,
     private val conexoes: Int = CONEXOES,
@@ -57,6 +64,7 @@ class ParaleloDataSource(
     // por estas transferencias, nunca a entrega de memoria ao ExoPlayer.
     private val medidor: PassivoMedidor? = null,
     private val token: Long = 0L,
+    private val sessao: SessaoParalela = SessaoParalela(),
     // Injetaveis para os testes de falha/cancelamento; producao usa a rede real.
     private val novaConexao: (URL) -> HttpURLConnection = { it.openConnection() as HttpURLConnection },
     private val dormir: (Long) -> Unit = { Thread.sleep(it) },
@@ -80,10 +88,16 @@ class ParaleloDataSource(
 
     companion object {
         private const val TAG = "nuvio-paralelo"
-        const val CONEXOES = 4
-        const val PEDACO = 4 shl 20           // 4 MB por pedido
-        private const val ADIANTE = 3         // pedacos em voo por conexao
-        private const val TENTATIVAS = 3
+        // Measured on Shield: 4 x 4 MB plus the Stage 6 connection bucket
+        // capped a LAN fixture at ~63 Mbps. Two 16 MB lanes keep no more than
+        // two chunk requests ahead (three CDN requests including bootstrap),
+        // while still filling a 32 MB retained window for distant servers.
+        const val CONEXOES = 2
+        const val PEDACO = 16 shl 20          // 16 MB por pedido
+        private const val ADIANTE = 1         // dois pedacos em voo no total
+        // One fresh-connection retry for a mid-chunk read failure.
+        private const val TENTATIVAS = 2
+        private const val TENTATIVAS_ABRIR = 2
         private val ESPERA_TENTATIVA_MS = longArrayOf(250L, 750L)
         // O primeiro pedido e menor: a imagem nao espera 4 MB chegarem.
         private const val PRIMEIRO = 1 shl 20
@@ -102,19 +116,26 @@ class ParaleloDataSource(
     class Factory(private val ua: String?, private val props: Map<String, String>,
                   private val unica: HttpDataSource.Factory,
                   private val medidor: PassivoMedidor? = null,
-                  private val token: Long = 0L) : DataSource.Factory {
-        override fun createDataSource(): DataSource = Seletor(ua, props, unica.createDataSource(), medidor, token)
+                  private val token: Long = 0L,
+                  private val modo: () -> Int = { 0 }) : DataSource.Factory {
+        private val sessao = SessaoParalela()
+        override fun createDataSource(): DataSource = Seletor(ua, props, unica.createDataSource(), medidor, token, modo, sessao)
     }
 
     // Escolhe por pedido: paralelo para arquivo progressivo, unica para o resto.
     // Os ouvintes de transferencia (medidor de banda do ExoPlayer) vao para os dois.
     private class Seletor(private val ua: String?, private val props: Map<String, String>,
                           private val unica: DataSource,
-                          private val medidor: PassivoMedidor?, private val token: Long) : DataSource {
+                          private val medidor: PassivoMedidor?, private val token: Long,
+                          private val modo: () -> Int, private val sessao: SessaoParalela) : DataSource {
         private var atual: DataSource? = null
         private val ouvintes = ArrayList<androidx.media3.datasource.TransferListener>()
         override fun open(dataSpec: DataSpec): Long {
-            val d = if (serve(dataSpec.uri)) ParaleloDataSource(ua, props, medidor = medidor, token = token).also { p ->
+            val paralelo = modo() == 0 && serve(dataSpec.uri)
+            val quente = paralelo && sessao.preparar(dataSpec.uri.toString())
+            RedeDiag.abertura(if (paralelo) "parallel" else "single", dataSpec.position,
+                dataSpec.uri.host.orEmpty().lowercase(), quente)
+            val d = if (paralelo) ParaleloDataSource(ua, props, medidor = medidor, token = token, sessao = sessao).also { p ->
                 for (o in ouvintes) p.addTransferListener(o)
             } else unica
             atual = d
@@ -180,10 +201,11 @@ class ParaleloDataSource(
 
     private fun conectar1(u: URL, ini: Long, ultimo: Long): HttpURLConnection {
         conferirCancelamento()
+        TaxaConexao.adquirir(u.host) { fechado }
         val c = novaConexao(u)
         ativas.add(c)
         if (fechado) { desconectar(c); throw cancelado() }
-        c.connectTimeout = 15000
+        c.connectTimeout = 3500
         c.readTimeout = 20000
         // Redirecionamento seguido A MAO (conectar): o HttpURLConnection nao
         // segue troca de protocolo (https -> http), e o AIOStreams/ElfHosted faz
@@ -193,6 +215,8 @@ class ParaleloDataSource(
         for ((k, v) in props) c.setRequestProperty(k, v)
         c.setRequestProperty("Accept-Encoding", "identity")
         c.setRequestProperty("Range", if (ultimo >= 0) "bytes=$ini-$ultimo" else "bytes=$ini-")
+        // responseCode performs the actual connect. It remains in conectar(),
+        // where redirects and diagnostics have the final timing context.
         return c
     }
 
@@ -202,16 +226,27 @@ class ParaleloDataSource(
             val t0 = android.os.SystemClock.elapsedRealtime()
             val c = conectar1(u, ini, ultimo)
             val code = try { c.responseCode } catch (e: IOException) {
+                val ms = android.os.SystemClock.elapsedRealtime() - t0
+                RedeDiag.falha(u.host.lowercase(), e, ms, true)
+                TaxaConexao.falhou(u.host, RedeDiag.classe(e, true))
                 desconectar(c)
-                throw e
+                throw FalhaConexaoHost(u.host.lowercase(), e)
             }
+            val ms = android.os.SystemClock.elapsedRealtime() - t0
+            RedeDiag.conexao(u.host.lowercase(), ms)
             Estat.primeiroByteMs = (android.os.SystemClock.elapsedRealtime() - t0).toInt()
             if (code in 300..399 && code != 304) {
                 val loc = c.getHeaderField("Location")
                 desconectar(c)
                 if (loc.isNullOrEmpty()) throw IOException("HTTP $code sem Location")
                 u = URL(u, loc)
+                RedeDiag.resolvida(u.host.lowercase(), code, ms)
                 return@repeat
+            }
+            if (code == 429 || code == 503) {
+                val retry = c.getHeaderField("Retry-After")?.trim()?.toLongOrNull()?.times(1000L) ?: 0L
+                TaxaConexao.falhou(u.host, "http_$code", retry)
+                RedeDiag.http(u.host.lowercase(), code, ms)
             }
             Estat.hostDe(c.url)
             return c
@@ -223,22 +258,22 @@ class ParaleloDataSource(
     // ConnectException escapava daqui e encerrava a fonte, embora os pedacos
     // posteriores aparentassem ter TENTATIVAS. Mantem o retry no Loader (nao no
     // fio do player) e curto o bastante para nao esconder uma rota morta.
-    internal fun conectarComRetry(u: URL, ini: Long, ultimo: Long): HttpURLConnection {
+    internal fun conectarComRetry(u: URL, ini: Long, ultimo: Long, tentativas: Int): HttpURLConnection {
         var erro: IOException? = null
-        repeat(TENTATIVAS) { tentativa ->
+        var hostErro = u.host.lowercase()
+        repeat(tentativas) { tentativa ->
             try { return conectar(u, ini, ultimo) }
             catch (e: IOException) {
-                erro = e
+                hostErro = (e as? FalhaConexaoHost)?.hostFalho ?: u.host.lowercase()
+                erro = ((e as? FalhaConexaoHost)?.cause as? IOException) ?: e
                 // SocketTimeoutException tambem herda InterruptedIOException:
                 // so a nossa sentinela (ou close/interrupcao real) cancela.
                 if (foiCancelado(e)) throw e
-                if (tentativa + 1 < TENTATIVAS) {
-                    Log.w(TAG, "conexao ${tentativa + 1}/$TENTATIVAS falhou em ${u.host}; tentando de novo")
-                    esperarTentativa(tentativa)
-                }
+                if (tentativa + 1 < tentativas) esperarTentativa(tentativa)
             }
         }
-        throw FalhaDownloadParalelo(erro ?: IOException("conexao falhou"))
+        val e = erro ?: IOException("conexao falhou")
+        throw FalhaDownloadParalelo(hostErro, RedeDiag.classe(e, true), e)
     }
 
     override fun open(dataSpec: DataSpec): Long {
@@ -256,10 +291,35 @@ class ParaleloDataSource(
         transferInitializing(dataSpec)
         Log.i(TAG, "abrindo ${dataSpec.uri.host} a partir de ${dataSpec.position}")
         pos = dataSpec.position
+        val destinoQuente = sessao.destino()
+        if (destinoQuente != null && sessao.tamanho() > 0) {
+            total = sessao.tamanho()
+            urlFinal = destinoQuente
+            fim = if (dataSpec.length != C.LENGTH_UNSET.toLong()) minOf(total, pos + dataSpec.length) else total
+            val guardado = sessao.trecho(pos)
+            if (guardado != null) {
+                bufIni = guardado.inicio
+                buf = guardado.dados
+                proximoPedido = guardado.fim
+                exec = Executors.newFixedThreadPool(conexoes)
+                encher()
+                aberto = true
+                transferStarted(dataSpec)
+                return fim - pos
+            }
+        }
         // Primeiro pedaco pela URL original: segue os redirecionamentos do debrid
         // uma vez so; os pedacos seguintes vao direto ao endereco final.
-        val c = conectarComRetry(URL(dataSpec.uri.toString()), pos, pos + PRIMEIRO - 1)
-        val code = c.responseCode
+        var c = conectarComRetry(destinoQuente ?: URL(dataSpec.uri.toString()), pos,
+            pos + PRIMEIRO - 1, TENTATIVAS_ABRIR)
+        var code = c.responseCode
+        // A retained signed CDN URL can expire. Re-resolve the original once.
+        if (destinoQuente != null && code in intArrayOf(403, 404, 410)) {
+            desconectar(c)
+            sessao.invalidarDestino()
+            c = conectarComRetry(URL(dataSpec.uri.toString()), pos, pos + PRIMEIRO - 1, TENTATIVAS_ABRIR)
+            code = c.responseCode
+        }
         if (code == 206) {
             val cr = c.getHeaderField("Content-Range") ?: ""
             total = cr.substringAfter('/', "").trim().toLongOrNull() ?: C.LENGTH_UNSET.toLong()
@@ -269,14 +329,13 @@ class ParaleloDataSource(
             // Sem Range (ou pequeno demais para valer a pena): conexao unica.
             if (code == 206 || code == 200) {
                 // 206 de um pedaco so: reabre sem teto para o arquivo inteiro.
-                if (code == 206) { desconectar(c); unicaCon = conectarComRetry(URL(dataSpec.uri.toString()), pos, -1) }
+                if (code == 206) { desconectar(c); unicaCon = conectarComRetry(URL(dataSpec.uri.toString()), pos, -1, TENTATIVAS_ABRIR) }
                 else unicaCon = c
                 val uc = unicaCon!!
                 if (uc.responseCode !in 200..299) {
                     val erro = HttpDataSource.InvalidResponseCodeException(
                         uc.responseCode, uc.responseMessage, null, uc.headerFields, dataSpec, ByteArray(0))
-                    desconectar(uc)
-                    unicaCon = null
+                    desconectar(uc); unicaCon = null
                     throw erro
                 }
                 unicaIn = uc.inputStream
@@ -295,11 +354,41 @@ class ParaleloDataSource(
             throw HttpDataSource.InvalidResponseCodeException(code, msg, null, hdr, dataSpec, ByteArray(0))
         }
         urlFinal = c.url
+        sessao.configurar(c.url, total)
         fim = if (dataSpec.length != C.LENGTH_UNSET.toLong()) minOf(total, pos + dataSpec.length) else total
-        val primeiro = try { lerTudo(c) } finally { desconectar(c) }
+        var primeiro: ByteArray? = null
+        var erroInicial: IOException? = null
+        for (tentativa in 0 until TENTATIVAS) {
+            try {
+                val dados = lerTudo(c)
+                val esperado = minOf(PRIMEIRO.toLong(), total - pos).toInt()
+                if (dados.size != esperado) throw IOException("primeiro pedaco curto: ${dados.size} de $esperado")
+                primeiro = dados
+                TaxaConexao.sucesso(c.url.host)
+                break
+            } catch (e: IOException) {
+                erroInicial = e
+                if (foiCancelado(e)) throw e
+                val classe = RedeDiag.classe(e)
+                TaxaConexao.falhou(c.url.host, classe)
+                RedeDiag.pedaco(-1, c.url.host.lowercase(), e, tentativa + 1, TENTATIVAS)
+                desconectar(c)
+                if (tentativa + 1 < TENTATIVAS) {
+                    esperarTentativa(tentativa)
+                    c = conectarComRetry(urlFinal!!, pos, pos + PRIMEIRO - 1, 1)
+                    if (c.responseCode != 206) throw IOException("HTTP ${c.responseCode} no primeiro pedaco")
+                }
+            }
+        }
+        desconectar(c)
+        val dadosIniciais = primeiro ?: run {
+            val e = erroInicial ?: IOException("primeiro pedaco falhou")
+            throw FalhaDownloadParalelo(urlFinal!!.host.lowercase(), RedeDiag.classe(e), e)
+        }
         bufIni = pos
-        buf = primeiro
-        proximoPedido = pos + primeiro.size
+        buf = dadosIniciais
+        sessao.guardar(bufIni, dadosIniciais)
+        proximoPedido = pos + dadosIniciais.size
         exec = Executors.newFixedThreadPool(conexoes)
         encher()
         aberto = true
@@ -331,14 +420,19 @@ class ParaleloDataSource(
         while (pedidos.size < conexoes * ADIANTE && proximoPedido < fim) {
             val ini = proximoPedido
             val ult = minOf(fim, ini + pedaco) - 1
-            pedidos[ini] = ex.submit<ByteArray> { baixar(u, ini, ult) }
+            pedidos[ini] = ex.submit<ByteArray> {
+                val guardado = sessao.trecho(ini)
+                if (guardado != null && guardado.inicio == ini && guardado.dados.size.toLong() == ult - ini + 1)
+                    guardado.dados
+                else baixar(u, ini, ult)
+            }
             proximoPedido = ult + 1
         }
     }
 
     private fun baixar(u: URL, ini: Long, ult: Long): ByteArray {
         var ultimoErro: IOException? = null
-        repeat(TENTATIVAS) {
+        repeat(TENTATIVAS) { tentativa ->
             conferirCancelamento()
             // Uma conexao paralela ativa, do connect ao ultimo byte. As outras
             // somam no mesmo segundo do medidor; nada e contado duas vezes.
@@ -346,22 +440,28 @@ class ParaleloDataSource(
             Estat.conexoes.incrementAndGet()
             var c: HttpURLConnection? = null
             try {
-                c = conectar(u, ini, ult)
-                if (c.responseCode != 206) throw IOException("HTTP ${c.responseCode} no pedaco $ini-$ult")
-                val d = lerTudo(c)
+                val ligada = conectar(u, ini, ult)
+                c = ligada
+                if (ligada.responseCode != 206) throw IOException("HTTP ${ligada.responseCode} no pedaco $ini-$ult")
+                val d = lerTudo(ligada)
                 if (d.size.toLong() != ult - ini + 1) throw IOException("pedaco curto: ${d.size} de ${ult - ini + 1}")
+                TaxaConexao.sucesso(u.host)
+                sessao.guardar(ini, d)
                 return d
             } catch (e: IOException) {
                 ultimoErro = e
                 if (foiCancelado(e)) throw e
-                if (it + 1 < TENTATIVAS) esperarTentativa(it)
+                TaxaConexao.falhou(u.host, RedeDiag.classe(e))
+                RedeDiag.pedaco(ini / pedaco, u.host.lowercase(), e, tentativa + 1, TENTATIVAS)
+                if (tentativa + 1 < TENTATIVAS) esperarTentativa(tentativa)
             } finally {
                 desconectar(c)
                 Estat.conexoes.decrementAndGet()
                 medidor?.fim(token)
             }
         }
-        throw FalhaDownloadParalelo(ultimoErro ?: IOException("pedaco $ini-$ult falhou"))
+        val e = ultimoErro ?: IOException("pedaco $ini-$ult falhou")
+        throw FalhaDownloadParalelo(u.host.lowercase(), RedeDiag.classe(e), e)
     }
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {

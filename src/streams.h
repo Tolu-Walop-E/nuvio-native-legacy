@@ -300,6 +300,10 @@ int  stream_antecipada(int *estado);
 int  stream_urls_para_aquecer(char dst[][256], int max);
 // Conferencia de uma URL avulsa, sem lista (bloqueia; chamar de fio proprio).
 int  stream_url_serve(const char *url, const char *cabecalhos);
+// Final host refused/timed out in the Android player. Candidate validation
+// avoids the same node for the short recovery window without storing paths.
+void stream_host_pausar(const char *host);
+int  stream_host_pausado_url(const char *url);
 
 // 1 quando o texto da fonte diz "fora de cache" (ver Stream.foraCache).
 // Publica para o parser e o teste; a lista ja vem com o campo preenchido.

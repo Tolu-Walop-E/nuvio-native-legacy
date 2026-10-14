@@ -41,7 +41,7 @@ static const Item TELA[] = {
 #endif
       OPC(AJ_CACHE_SEEK), OPC(AJ_MANTER_VIDEO), OPC(AJ_SEEKR_AJUSTE),
 #ifdef NV_ANDROID
-      OPC(AJ_BUFFER),
+      OPC(AJ_BUFFER), OPC(AJ_REDE_MODO),
 #endif
 #ifndef __EMSCRIPTEN__
     // .wgt: sem socket TCP/UDP no navegador, sem motor; P2P escondido (a8e7685d).
