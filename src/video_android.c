@@ -58,7 +58,7 @@ static jmethodID mAbrirPosicao;
 static jmethodID mAbrirRetomada;
 // F07 (optional, like abrirPosicao): cache(mb) and ganho(pct). A shell without
 // them simply has no seek cache and no boost.
-static jmethodID mCache, mGanho, mBuffer;
+static jmethodID mCache, mGanho, mBuffer, mRede;
 // #202 (opcional, como os de cima): velocidade(centesimos). Casca sem ele =
 // sem a linha da velocidade.
 static jmethodID mVelocidade;
@@ -82,6 +82,8 @@ static int resolverMetodos(JNIEnv *env) {
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mCache = NULL; }
   mBuffer = (*env)->GetStaticMethodID(env, gCls, "buffer", "(I)V");
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mBuffer = NULL; }
+  mRede = (*env)->GetStaticMethodID(env, gCls, "rede", "(I)V");
+  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mRede = NULL; }
   mGanho = (*env)->GetStaticMethodID(env, gCls, "ganho", "(I)V");
   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mGanho = NULL; }
   mVelocidade = (*env)->GetStaticMethodID(env, gCls, "velocidade", "(I)V");
@@ -272,7 +274,7 @@ static unsigned sessao;
 // F07: the player arms the next video_tocar with its cache limit
 // (cacheboost_backend_cache); trailers never arm, so they stay uncached and
 // at 100%. `cacheSessao` survives the reconnection reopens of that video.
-static int bufferPreset, bufferEnviado;
+static int bufferPreset, bufferEnviado, redeModo, redeEnviado = -1;
 static int cacheArmado = -1, cacheSessao, cacheEnviado, playerSessao;
 static int ganhoEnviado = CB_VOL_NORMAL;
 static int retomadaInicialEstado = -1;
@@ -287,6 +289,7 @@ static volatile int reconErroPend, reconErroCod, reconErroVideo;
 static int reconAudio = -1, reconLeg = -1;
 static volatile int reconFaixasPend;
 static int reconBuscarMs = -1;
+static int reconPausado;
 static char erroTxt[64];
 
 // Codigos do PlaybackException (Media3) que sao de REDE: IO_UNSPECIFIED 2000,
@@ -294,6 +297,7 @@ static char erroTxt[64];
 // MEDIDO em aparelho: status HTTP (2004), 403/404 e formato quebrado ficam de
 // fora de proposito, recarregar a mesma URL so repete a recusa.
 static int erroDeRede(int cod) { return cod >= 2000 && cod <= 2002; }
+#define ERRO_HOST_ESGOTADO (-20001)
 
 void video_escolher_audio(int i);
 
@@ -561,6 +565,14 @@ JNIEXPORT void JNICALL Java_space_nuvio_nativelegacy_NvPlayer_nativeEvento(JNIEn
   if (tipo != EV_BUFFER) { printf("[video] android evento %d (%d, %d)\n", tipo, a, b); fflush(stdout); }
 }
 
+JNIEXPORT void JNICALL Java_space_nuvio_nativelegacy_NvPlayer_nativeHostFalhou(JNIEnv *env, jclass cls, jstring host) {
+  const char *h;
+  (void)cls;
+  if (!host) return;
+  h = (*env)->GetStringUTFChars(env, host, NULL);
+  if (h) { stream_host_pausar(h); (*env)->ReleaseStringUTFChars(env, host, h); }
+}
+
 // --- video.h (C -> Kotlin) -----------------------------------------------------
 int  video_iniciar(void) {
   JNIEnv *env;
@@ -596,6 +608,11 @@ static int abrirSessao(int inicioMs, int fracao) {
     (*env)->CallStaticVoidMethod(env, gCls, mBuffer, (jint)bufferPreset);
     fimChamada(env);
     bufferEnviado = bufferPreset;
+  }
+  if (mRede && redeModo != redeEnviado) {
+    (*env)->CallStaticVoidMethod(env, gCls, mRede, (jint)redeModo);
+    fimChamada(env);
+    redeEnviado = redeModo;
   }
   if (mCache && cacheSessao != cacheEnviado) {
     (*env)->CallStaticVoidMethod(env, gCls, mCache, (jint)cacheSessao);
@@ -657,7 +674,7 @@ int video_tocar_retomada(const char *u, double segundos, double pct) {
   nv_recon_zerar(&recon);
   reconPermitida = reconProxima; reconProxima = 0;
   reconIniciou = 0; reconErroPend = 0;
-  reconAudio = reconLeg = -1; reconFaixasPend = 0; reconBuscarMs = -1;
+  reconAudio = reconLeg = -1; reconFaixasPend = 0; reconBuscarMs = -1; reconPausado = 0;
   playerSessao = cacheArmado >= 0;
   cacheSessao = cacheArmado > 0 ? cacheArmado : 0;
   cacheArmado = -1;
@@ -666,6 +683,7 @@ int video_tocar_retomada(const char *u, double segundos, double pct) {
 int video_tocar_posicao(const char *u, double segundos) { return video_tocar_retomada(u, segundos, 0.0); }
 
 void cacheboost_backend_buffer(int p) { bufferPreset = p >= 0 && p <= 3 ? p : 0; }
+void cacheboost_backend_rede(int m) { redeModo = m == 1 ? 1 : 0; }
 void cacheboost_backend_cache(int mb) { cacheArmado = mb > 0 ? mb : 0; }
 void cacheboost_backend_ganho(int pct) {
   if (pct < CB_VOL_MIN) pct = CB_VOL_MIN;
@@ -693,7 +711,7 @@ void video_bombear(void) {
   if (prontoLoad && pos > 0.5) reconIniciou = 1;
   if (prontoLoad && reconBuscarMs < 0) nv_recon_progresso(&recon, pos);
   // O seek do recarregar sai com o player ja tocando.
-  if (reconBuscarMs >= 0 && prontoLoad && tocando) {
+  if (reconBuscarMs >= 0 && prontoLoad && (tocando || reconPausado)) {
     kInt(mBuscar, reconBuscarMs);
     printf("[video] reconexao: retomado em %ds\n", reconBuscarMs / 1000);
     fflush(stdout);
@@ -703,9 +721,22 @@ void video_bombear(void) {
     int antes = recon.tentativa;
     int rede = erroDeRede(reconErroCod);
     reconErroPend = 0;
+    // O downloader ja confirmou a falha e TaxaConexao pausou o host final.
+    // Reabrir a mesma URL pelo ciclo 3/10/25 s so prolongaria a interrupcao;
+    // entregue a falha agora para o failover nativo escolher outra rota.
+    if (reconErroCod == ERRO_HOST_ESGOTADO) {
+      printf("[video] host final indisponivel; pulando reconexoes da mesma URL\n");
+      fflush(stdout);
+      falhou = 1;
+      bufferando = 0;
+      return;
+    }
     if (reconPermitida && urlAtual[0] && (reconIniciou || recon.tentativa) &&
         nv_recon_erro(&recon, rede, SDL_GetTicks(), pos)) {
-      if (!antes) { reconAudio = audioAtual; reconLeg = legAtual; }
+      if (!antes) {
+        reconAudio = audioAtual; reconLeg = legAtual;
+        reconPausado = pausaPedida && pausaVista;
+      }
       if (recon.tentativa != antes) {
         printf("[video] conexao caiu (%d): tentativa %d/%d, espera %us\n",
                reconErroCod, recon.tentativa, NV_RECON_MAX,
@@ -724,18 +755,26 @@ void video_bombear(void) {
     reconFaixasPend = 1;
     reconBuscarMs = recon.alvo > 1.0 ? (int)(recon.alvo * 1000.0) : -1;
     if (!abrirSessao(0, 0)) { reconErroCod = -1; reconErroPend = 1; }
+    else if (reconPausado) {
+      pausaPedida = 1; pausaVista = 0;
+      kInt(mPausar, 1);
+    }
   }
 }
 void video_parar(void) {
   novaRetomada(-1);
   capmkv_zerar();   // fio de capitulos em voo nao alimenta o proximo titulo
   nv_recon_zerar(&recon);
-  reconErroPend = 0; reconErroVideo = 0; reconFaixasPend = 0; reconBuscarMs = -1;
+  reconErroPend = 0; reconErroVideo = 0; reconFaixasPend = 0; reconBuscarMs = -1; reconPausado = 0;
   if (ativo) kSemArg(mParar);
   ativo = prontoLoad = primeiroQuadro = tocando = 0; superficieEstavel = 0;
   pausaPedida = pausaVista = 0;
 }
-void video_pausar(int p) { pausaVista = 0; pausaPedida = p ? 1 : 0; kInt(mPausar, p ? 1 : 0); }
+void video_pausar(int p) {
+  pausaVista = 0; pausaPedida = p ? 1 : 0;
+  if (nv_recon_ativa(&recon)) reconPausado = pausaPedida;
+  kInt(mPausar, pausaPedida);
+}
 int video_pausa_confirmada(void) {
   return pausaPedida && pausaVista && !tocando && ativo && prontoLoad && primeiroQuadro &&
          !falhou && !terminou && !video_reconectando();

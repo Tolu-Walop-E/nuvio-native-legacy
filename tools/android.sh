@@ -2,6 +2,7 @@
 # Build do Nuvio para Android TV/Mobile (SDL2 + GLES2, nucleo C em libmain.so).
 #
 #   tools/android.sh            -> APK debug em build/android/Nuvio-<v>-android-debug.apk
+#   NUVIO_ANDROID_TAREFA=assembleRede tools/android.sh -> pacote de rede separado
 #   NUVIO_P2P_MOTOR=<raiz> tools/android.sh -> motor P2P (padrao: pasta achada por tools/p2p-motor/pasta.sh; =none desliga)
 #   NUVIO_KEYSTORE=... NUVIO_KEYSTORE_PASS=... NUVIO_KEY_ALIAS=... NUVIO_KEY_PASS=... tools/android.sh
 #                               -> tambem o release assinado, Nuvio-<v>-android.apk
@@ -91,7 +92,7 @@ GR=(android/gradlew -p android --console=plain -Pnuvio.sdlSrc="$CACHE/src" -Pnuv
 nv_p2p_resolver android
 [ -n "$NV_P2P_DIR" ] && GR+=(-Pnuvio.p2pMotor="$NV_P2P_DIR")
 TAREFAS=()
-[ "$RELEASE_ONLY" = 1 ] || TAREFAS=(assembleDebug)
+[ "$RELEASE_ONLY" = 1 ] || TAREFAS=("${NUVIO_ANDROID_TAREFA:-assembleDebug}")
 # Chave de release FIXA (o Android so atualiza por cima com a mesma
 # assinatura): ~/.nuvio-android/release.env, fora do repo, chmod 600. A copia
 # de seguranca e o item do Vaultwarden. Variaveis no ambiente ganham do arquivo.
@@ -105,11 +106,18 @@ fi
 
 echo "[5/5] conferencia"
 SAIDA="$EST"
-DBG="android/app/build/outputs/apk/debug/app-debug.apk"
+TAREFA="${NUVIO_ANDROID_TAREFA:-assembleDebug}"
+if [ "$TAREFA" = assembleRede ]; then
+  DBG="android/app/build/outputs/apk/rede/app-rede.apk"
+  DBG_NOME="Nuvio-$VER-android-rede.apk"
+else
+  DBG="android/app/build/outputs/apk/debug/app-debug.apk"
+  DBG_NOME="Nuvio-$VER-android-debug.apk"
+fi
 APKS=()
 if [ "$RELEASE_ONLY" = 0 ]; then
-  cp "$DBG" "$SAIDA/Nuvio-$VER-android-debug.apk"
-  APKS+=("$SAIDA/Nuvio-$VER-android-debug.apk")
+  cp "$DBG" "$SAIDA/$DBG_NOME"
+  APKS+=("$SAIDA/$DBG_NOME")
 fi
 if [ -n "${NUVIO_KEYSTORE:-}" ]; then
   cp android/app/build/outputs/apk/release/app-release.apk "$SAIDA/Nuvio-$VER-android.apk"

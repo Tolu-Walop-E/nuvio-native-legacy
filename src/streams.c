@@ -1250,6 +1250,44 @@ static int resolverUrl(const char *url, const char *cabecalhos, int segundos,
   return 0;
 }
 
+static char hostPlayerPausado[256];
+static Uint32 hostPlayerAte;
+
+void stream_host_pausar(const char *host) {
+  size_t n;
+  if (!host || !*host) return;
+  n = strcspn(host, "/?#:");
+  if (!n || n >= sizeof hostPlayerPausado) return;
+  pthread_mutex_lock(&verTrava);
+  for (size_t i = 0; i < n; i++) hostPlayerPausado[i] = (char)tolower((unsigned char)host[i]);
+  hostPlayerPausado[n] = 0;
+  hostPlayerAte = SDL_GetTicks() + 60000u;
+  pthread_mutex_unlock(&verTrava);
+}
+
+int stream_host_pausado_url(const char *url) {
+  char host[256];
+  const char *p, *fim, *arroba;
+  size_t n;
+  int pausado = 0;
+  if (!url || !(p = strstr(url, "://"))) return 0;
+  p += 3; fim = p + strcspn(p, "/?#");
+  arroba = memchr(p, '@', (size_t)(fim - p));
+  if (arroba) p = arroba + 1;
+  if (*p == '[') { p++; fim = memchr(p, ']', (size_t)(fim - p)); if (!fim) return 0; }
+  else { const char *porta = memchr(p, ':', (size_t)(fim - p)); if (porta) fim = porta; }
+  n = (size_t)(fim - p); if (!n || n >= sizeof host) return 0;
+  for (size_t i = 0; i < n; i++) host[i] = (char)tolower((unsigned char)p[i]);
+  host[n] = 0;
+  pthread_mutex_lock(&verTrava);
+  if (hostPlayerPausado[0] && (Sint32)(hostPlayerAte - SDL_GetTicks()) > 0 &&
+      !strcmp(hostPlayerPausado, host)) pausado = 1;
+  else if (hostPlayerPausado[0] && (Sint32)(hostPlayerAte - SDL_GetTicks()) <= 0)
+    hostPlayerPausado[0] = 0;
+  pthread_mutex_unlock(&verTrava);
+  return pausado;
+}
+
 static int verificarUma(int i, Conferencia *c) {
   char fim[4096], url[4096], cab[512], mime[96], addon[sizeof lista->provedor];
   int fileIdx, ok = 0;
@@ -1301,6 +1339,8 @@ static int verificarUma(int i, Conferencia *c) {
     ok = 0;
   } else if (!resolverUrl(url, cab, 10, fim, sizeof fim, mime, sizeof mime, &corpo)) {
     printf("[fonte] %d nao resolveu\n", i);
+  } else if (stream_host_pausado_url(fim)) {
+    printf("[fonte] %d resolveu para host temporariamente pausado\n", i);
   } else if (naovideo_mime(mime, fim, corpo)) {
     // Linha de aviso do addon (doacao, Discord, "indisponivel"): a URL leva a
     // uma pagina, nao a um video. Fica marcada na folha e o automatico passa
@@ -1328,6 +1368,7 @@ int stream_url_serve(const char *url, const char *cabecalhos) {
   long corpo = -1;
   if (!url || !*url) return 0;
   if (!resolverUrl(url, cabecalhos, 5, fim, sizeof fim, mime, sizeof mime, &corpo)) return 0;
+  if (stream_host_pausado_url(fim)) return 0;
   if (naovideo_mime(mime, fim, corpo)) return 0;
   if (enderecoDeAviso(fim)) return 0;
   if (playlistVazia(fim, cabecalhos)) return 0;
@@ -1599,6 +1640,12 @@ static int falhaCandidatas(unsigned geracao, int escolhida, int primeira, FonteF
     // rota escolhida. URL direta fora de cache continua fora do automatico.
     excl[q] = (unsigned char)(s->urlP2P || (s->foraCache && !s->infoHash[0]) || ehInformativa(s) || excedeDecoder(s) ||
                  (!s->infoHash[0] && (automaticaExcluida(i) || fontesmortas_idade(s) >= 0)));
+    // Failover never silently lowers resolution or drops Dolby Vision. The
+    // original chosen source remains eligible on the first pass; alternatives
+    // after a failure must meet its declared quality floor.
+    if (!primeira && escolhida >= 0 && escolhida < total && i != escolhida &&
+        (s->altura < copia[escolhida].altura || s->dolbyVision < copia[escolhida].dolbyVision))
+      excl[q] = 1;
     grp[q] = (signed char)grupoDe(i);
     // Escolha explicita continua podendo tocar fora das regras do automatico.
     // As alternativas conservam os filtros; somente esta linha e preferida.

@@ -147,4 +147,5 @@ double cacheboost_volume_db(int pct) {
 void cacheboost_backend_ganho(int pct) { (void)pct; }
 void cacheboost_backend_cache(int mb) { (void)mb; }
 void cacheboost_backend_buffer(int preset) { (void)preset; }
+void cacheboost_backend_rede(int modo) { (void)modo; }
 #endif

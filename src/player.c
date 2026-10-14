@@ -1475,6 +1475,7 @@ void player_abrir(int indiceCatalogo, const char *url) {
   // refuses HLS/DASH). Arms only the next video_tocar: trailers stay uncached.
   cacheboost_backend_cache(ehCanal() ? 0 : ajustes_cache_seek_mb());
   cacheboost_backend_buffer(ajustes_buffer_preset());
+  cacheboost_backend_rede(ajustes_rede_modo());
   loadEm = SDL_GetTicks();
   { char px[96];
     if (url && *url) { memlog_evento("load"); memQuadroPendente = 1; }
@@ -1565,6 +1566,7 @@ static void tocarFonte(const char *url) {
   cacheboost_backend_cache(ehCanal() ? 0 : ajustes_cache_seek_mb());   // F07, ver player_abrir
   memlog_evento("load"); memQuadroPendente = 1;
   cacheboost_backend_buffer(ajustes_buffer_preset());
+  cacheboost_backend_rede(ajustes_rede_modo());
   { char px[96];
 #ifdef NV_ANDROID
     // app.c define episodio e "do inicio" antes de entregar a fonte. O

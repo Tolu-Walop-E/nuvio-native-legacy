@@ -23,9 +23,12 @@ android {
     namespace = "space.nuvio.nativelegacy"
     compileSdk = 35
     ndkVersion = "27.2.12479018"
+    // Device network benchmarks must target the isolated .rede application.
+    testBuildType = "rede"
 
     defaultConfig {
         applicationId = "space.nuvio.nativelegacy"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         minSdk = 24
         targetSdk = 35
         versionCode = vx * 10000 + vy * 100 + vz
@@ -64,6 +67,12 @@ android {
         }
     }
     buildTypes {
+        create("rede") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".rede"
+            versionNameSuffix = "-rede"
+            matchingFallbacks += listOf("debug")
+        }
         release {
             isMinifyEnabled = false
             if (ks != null) signingConfig = signingConfigs.getByName("release")
@@ -86,6 +95,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    testOptions { unitTests.isReturnDefaultValues = true }
 }
 
 // Copia as classes Java do SDL no build (nada de copia grande no git).
@@ -126,5 +136,8 @@ dependencies {
         implementation("org.jellyfin.media3:media3-ffmpeg-decoder:1.8.0+1")
     }
     implementation("androidx.core:core-ktx:1.13.1")
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }
 

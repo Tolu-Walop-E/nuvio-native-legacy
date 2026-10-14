@@ -127,6 +127,7 @@ object NvPlayer {
     // --- natives (src/video_android.c, Java_space_nuvio_nativelegacy_NvPlayer_*) ---
     @JvmStatic external fun nativeIniciar()
     @JvmStatic external fun nativeEvento(tipo: Int, a: Int, b: Int)
+    @JvmStatic external fun nativeHostFalhou(host: String)
     // flags (#287): 1 = forcada (SELECTION_FLAG_FORCED), 2 = SDH
     // (ROLE_FLAG_DESCRIBES_MUSIC_AND_SOUND); nome = Format.label.
     // mime/canais (#293): codec e canais da faixa de audio.
@@ -330,14 +331,21 @@ object NvPlayer {
     @JvmStatic fun pausar(p: Int) { principal.post { player?.playWhenReady = (p == 0) } }
     @JvmStatic fun buscar(ms: Int) {
         val pedido = pedidos.get()
-        principal.post { if (pedido == pedidos.get()) player?.seekTo(ms.coerceAtLeast(0).toLong()) }
+        principal.post {
+            if (pedido == pedidos.get()) player?.let { p ->
+                Log.i(TAG, "[player] seek from=${p.currentPosition / 1000.0} to=${ms.coerceAtLeast(0) / 1000.0}")
+                p.seekTo(ms.coerceAtLeast(0).toLong())
+            }
+        }
     }
     @JvmStatic fun volume(pct: Int) { principal.post { player?.volume = pct.coerceIn(0, 100) / 100f } }
     // F07: cache limit for the NEXT opens (MB, 0 = off) and the session volume
     // 0..200 (above 100 only while the audio is PCM).
     // #338: buffer size preset (0 Auto, 1 Low, 2 Medium, 3 High), sticky, read at open.
     @Volatile private var bufferPreset = 0
+    @Volatile private var redeModo = 0
     @JvmStatic fun buffer(preset: Int) { bufferPreset = preset.coerceIn(0, 3) }
+    @JvmStatic fun rede(modo: Int) { redeModo = if (modo == 1) 1 else 0 }
     @JvmStatic fun cache(mb: Int) { cacheMbPedido = mb.coerceIn(0, 1024) }
     @JvmStatic fun ganho(pct: Int) {
         principal.post { ganhoPct = GanhoMath.pct(pct); aplicarGanho() }
@@ -415,7 +423,7 @@ object NvPlayer {
             medidorToken = medidor.sessao(geracao)
             ParaleloDataSource.Estat.zerar()
             quadrosPerdidos = 0L; statsTiques = 0
-            val rede = ParaleloDataSource.Factory(ua, props, http, medidor, medidorToken)
+            val rede = ParaleloDataSource.Factory(ua, props, http, medidor, medidorToken) { redeModo }
 
             // F07: SEEK CACHE over the chain above, progressive HTTP VOD only.
             // HLS/DASH (and the live channels, which C never arms) stay out:
@@ -495,13 +503,13 @@ object NvPlayer {
             val p = ExoPlayer.Builder(act, renderizadores)
                 .setLoadControl(carga)
                 .setMediaSourceFactory(DefaultMediaSourceFactory(act)
+                    .setLoadErrorHandlingPolicy(PoliticaErroParalelo())
                     // DefaultDataSource e nao so http: o trailer da Apple chega como
                     // file:// (master reduzido a uma variante em dados/trailer, trailerapple.c).
                     .setDataSourceFactory(DefaultDataSource.Factory(act, origem)))
                 .build()
             player = p
             aplicarGanho()
-            semTravaDeFio(p)
             // Release anterior ainda preso no HAL de audio: sessao de audio nova,
             // para o AudioTrack deste filme nao esperar o patch do velho.
             if (liberacoesEmCurso.get() > 0) {
@@ -586,9 +594,9 @@ object NvPlayer {
             try { if (ana != null) p.removeAnalyticsListener(ana) } catch (e: Exception) { }
             // Esconde sem destruir a superficie (destruir acorda o callback do Media3).
             try { sv?.layoutParams = FrameLayout.LayoutParams(1, 1) } catch (e: Exception) { }
-            liberarEmFundo(p, sv)
             // A superficie velha fica com o player velho; a proxima abertura cria outra.
             superficie = null
+            liberarEmFundo(p, sv)
         }
         // F07: the session cache goes with its player (released and deleted
         // off the main thread, after the canceled loaders unwind).
@@ -601,22 +609,6 @@ object NvPlayer {
         tap.encerrar()
         superficie?.visibility = View.GONE
     }
-
-    // O release roda em outro fio (liberarEmFundo) e o Media3 1.8 lanca se um
-    // fio que nao e o da aplicacao toca o player; o seletor e so do pacote, entao
-    // reflexao. Sem ele (outra versao), o release volta ao fio principal.
-    private fun semTravaDeFio(p: ExoPlayer) {
-        try {
-            val m = p.javaClass.getDeclaredMethod("setThrowsWhenUsingWrongThread", Boolean::class.javaPrimitiveType)
-            m.isAccessible = true
-            m.invoke(p, false)
-            fioLivre = true
-        } catch (e: Throwable) {
-            fioLivre = false
-            Log.w(TAG, "[player] sem destravar o fio do release (volta ao fio principal): $e")
-        }
-    }
-    @Volatile private var fioLivre = false
 
     private fun novaSuperficie(act: Activity) {
         if (superficie != null) return
@@ -657,14 +649,13 @@ object NvPlayer {
         }
     }
 
-    // stop+release do player velho fora do fio principal. A SurfaceView so sai
-    // da tela depois: tirar antes dispararia o callback de superficie do
-    // Media3, que espera o fio de reproducao (justo o que esta preso).
+    // Media3 requires applicationLooper affinity. Two asynchronous phases keep
+    // liberar() non-blocking while giving stop one loop turn before release.
     private fun liberarEmFundo(p: ExoPlayer, sv: SurfaceView?) {
         liberacoesEmCurso.incrementAndGet()
-        val corpo = Runnable {
+        val looper = Handler(p.applicationLooper)
+        val soltar = Runnable {
             val ini = SystemClock.elapsedRealtime()
-            try { p.stop() } catch (e: Exception) { Log.w(TAG, "stop: $e") }
             try { p.release() } catch (e: Exception) { Log.w(TAG, "release: $e") }
             val ms = SystemClock.elapsedRealtime() - ini
             if (ms > 5000) Log.w(TAG, "[player] release anterior levou $ms ms (>5 s: HAL de audio preso?)")
@@ -674,8 +665,11 @@ object NvPlayer {
                 if (sv != null && sv !== superficie) (sv.parent as? FrameLayout)?.removeView(sv)
             }
         }
-        if (fioLivre) { val t = Thread(corpo, "nv-release"); t.isDaemon = true; t.start() }
-        else corpo.run()
+        looper.post {
+            try { p.playWhenReady = false } catch (e: Exception) { Log.w(TAG, "pause release: $e") }
+            try { p.stop() } catch (e: Exception) { Log.w(TAG, "stop: $e") }
+            looper.postDelayed(soltar, 50)
+        }
     }
 
     // Tique de 250 ms: a posicao que o C le sem esperar ninguem.
@@ -1127,7 +1121,13 @@ object NvPlayer {
                 principal.postDelayed({ if (atual(minha)) abrirMain(u, c, true, inicio, geracao, pedido, fracao) }, 400)
                 return
             }
-            ev(EV_ERRO, error.errorCode, tipo)
+            val redeEsgotada = generateSequence<Throwable>(error) { it.cause }
+                .take(16).filterIsInstance<FalhaDownloadParalelo>().firstOrNull()
+            if (redeEsgotada != null)
+                Log.w(TAG, "[player] network host exhausted host=${redeEsgotada.hostFinal} class=${redeEsgotada.classeRede}")
+            if (redeEsgotada != null) try { nativeHostFalhou(redeEsgotada.hostFinal) }
+                catch (e: UnsatisfiedLinkError) { Log.w(TAG, "host failure without native core: $e") }
+            ev(EV_ERRO, if (redeEsgotada != null) -20001 else error.errorCode, tipo)
         }
     }
 
