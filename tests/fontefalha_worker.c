@@ -382,6 +382,30 @@ static void escolhaManual(void) {
   assert(nHttp == 1 && nPedidos == 2 && fontefalha_tentativas(s) == 3);
   fontefalha_sessao_liberar(s);
 }
+static void failoverPreservaQualidade(void) {
+  resetar(); FonteFalhaConfig c = cfg(0, 1, 4);
+  Stream l[] = {fonte(&c, 0, "", 0), fonte(&c, 0, "", 0), fonte(&c, 0, "", 0)};
+  strcpy(l[0].url, "https://addon.invalid/chosen-4k-dv.mkv");
+  strcpy(l[1].url, "https://addon.invalid/equal-4k-dv.mkv");
+  strcpy(l[2].url, "https://addon.invalid/lower-1080p.mkv");
+  l[0].altura = l[1].altura = 2160; l[2].altura = 1080;
+  l[0].dolbyVision = l[1].dolbyVision = 1; l[2].dolbyVision = 0;
+  stream_definir_lista(l, 3);
+  FonteFalhaSessao *s = fontefalha_sessao_nova(&c, 4, 0); assert(s);
+  int idx, serv; char url[4096]; unsigned ger = stream_lista_geracao();
+  assert(stream_falha_verificar(s, ger, 0, foiCancelado, NULL, &idx, &serv, url, sizeof url) == FONTEFALHA_PROXIMA);
+  assert(idx == 0); fontefalha_marcar_aberta(s);
+  assert(stream_falha_verificar(s, ger, 0, foiCancelado, NULL, &idx, &serv, url, sizeof url) == FONTEFALHA_PROXIMA);
+  assert(idx == 1 && "failover must retain 4K Dolby Vision floor");
+  fontefalha_marcar_aberta(s);
+  assert(stream_falha_verificar(s, ger, 0, foiCancelado, NULL, &idx, &serv, url, sizeof url) == FONTEFALHA_FIM);
+  fontefalha_sessao_liberar(s);
+}
+static void hostFinalPausado(void) {
+  stream_host_pausar("CDN.Example.Invalid");
+  assert(stream_host_pausado_url("https://cdn.example.invalid:443/file?token=redacted"));
+  assert(!stream_host_pausado_url("https://other.example.invalid/file"));
+}
 static void resolvedorManual(const char *dir) {
   resetar(); fontefalha_dir(dir);
   assert(fontefalha_definir_provedores(1));
@@ -437,6 +461,8 @@ int main(int argc, char **argv) {
   limiteNativoIndependente(); decoderAprendido();
   cachePertenceAoServico(); hashCanonicoEAplicacaoSobreposta();
   geracaoECancelamento(); addonIndependente(); buscaParcial(); escolhaManual();
+  failoverPreservaQualidade();
+  hostFinalPausado();
   resolvedorManual(argv[1]);
   stream_definir_lista(NULL, 0);
   puts("fontefalha worker: PASS (provider order, total limits, dedup, identity, generation, cancellation, addon order, partial search, manual selection, cached winner, P2P isolation)");
