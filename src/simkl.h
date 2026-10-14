@@ -38,15 +38,10 @@
 // mais e mais um nome que o CORS do servidor precisa aceitar. User-Agent sai
 // de rede.c.
 //
-// O QUE FICOU DE FORA, e por que:
-//   - anime em "watching": o next_to_watch de anime vem na numeracao do AniDB
-//     ("E12", sem temporada), e o resto do app (Cinemeta, addons) fala
-//     temporada/episodio do TVDB. Converter exigiria /anime/episodes por
-//     titulo. Anime PAUSADO entra, porque /sync/playback manda tvdb_season e
-//     tvdb_number junto.
-//   - scrobble: assistir aqui nao escreve no Simkl. O Simkl so cria playback a
-//     partir de /scrobble/pause|stop, entao o "continuar" do Simkl mostra o que
-//     outros clientes Simkl pausaram. Escrever e outro trabalho (outro issue).
+// Anime em "watching" usa E12 (AniDB), enquanto o app toca TVDB S/E. A leitura
+// resolve o episodio pela tabela autoritativa de /anime/episodes/{simkl_id};
+// nunca conta episodios da franquia. Scrobble usa as coordenadas TVDB que o
+// player ja conhece e deixa o proprio Simkl associa-las ao anime.
 //
 // MODELO DE FIOS: o de trakt.c. Leituras BLOQUEIAM e so sao chamadas do fio de
 // descoberta (montarContinuar, montar); escritas do "+" e do "tirar da
@@ -55,6 +50,7 @@
 #define NV_SIMKL_H
 #include "catalogo.h"
 #include "vistoep.h"
+#include "traktscrobble.h"
 #include <stddef.h>
 
 // 1 quando ha token do Simkl nesta TV (vinculo feito em Ajustes).
@@ -78,6 +74,20 @@ int simkl_ler_playback(const char *json, CatItem *dst, long long *ids, int max);
 // (next_to_watch "S02E05"), com progresso 0 e o last_watched_at como instante.
 // Serie sem next_to_watch (em dia com o que foi ao ar) nao entra.
 int simkl_ler_assistindo(const char *json, CatItem *dst, int max);
+
+// Candidato anime ainda em numeracao Simkl/AniDB. O id identifica a OBRA
+// exata (split cours podem ter o mesmo IMDb); `absoluto` e o E de next_to_watch.
+typedef struct {
+  CatItem item;
+  long long simklId;
+  int absoluto;
+} SimklAnimeProx;
+int simkl_ler_anime_assistindo(const char *json, SimklAnimeProx *dst, int max);
+
+// /anime/episodes/{id}: encontra a entrada cujo `episode` e `absoluto` e
+// devolve a coordenada TVDB. Duplicata conflitante, mapping ausente e S0 sao
+// recusados (0); coordenada positiva e inequivoca devolve 1.
+int simkl_ler_mapa_anime(const char *json, int absoluto, int *temporada, int *episodio);
 
 // GET /sync/all-items/<movies|shows>/plantowatch -> itens com naLista = 1.
 int simkl_ler_plantowatch(const char *json, int serie, CatItem *dst, int max);
@@ -153,6 +163,13 @@ const char *simkl_rota_historico(int visto);
 int simkl_episodios_marcar(const char *imdb, const VistoPar *pares, int qtd, int visto);
 int simkl_titulo_marcar(const char *imdb, const char *tipo, const int *temporadas,
                         int nt, int visto);
+
+// Progresso de reproducao para o Simkl. Start uma vez, pause a partir de 1% e
+// stop a partir do limiar local de conclusao (90%). Diferente do Trakt, Simkl
+// aceita pause entre 80-90%, evitando perder o ponto sem marcar como visto.
+// Assincrono e com uma unica vaga pendente; devolve SCR_*.
+int simkl_scrobble(int evento, const char *imdb, double posSeg, double durSeg);
+int simkl_marcar(const char *imdb, double posSeg, double durSeg);
 
 // Esquece caches e tabelas (logout, desvincular). O token e de simklauth.c.
 void simkl_esquecer(void);

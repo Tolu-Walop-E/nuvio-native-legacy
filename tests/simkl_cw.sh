@@ -8,7 +8,8 @@
 # com nome (AJ_CWF_*, AJ_SALVOS_*) sao conferidos por _Static_assert no .c.
 #
 # A segunda roda src/simkl.c contra uma rede falsa (tests/simkl_cw.c): so
-# simkl.c e js.c entram, o resto (token, nuvem, enfeite) e stub. Sem SDL
+# simkl.c, js.c e a decisao/corpo de scrobble entram; o resto (token, nuvem,
+# enfeite) e stub. Sem SDL
 # linkado, sem rede.
 set -eu
 cd "$(dirname "$0")/.."
@@ -48,5 +49,5 @@ tmp="$(mktemp -d "${TMPDIR:-/tmp}/nuvio-simkl-cw-XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 cc -O1 -g -Wall -Wextra -Isrc -I/opt/homebrew/include -I/opt/homebrew/include/SDL2 \
   -Wno-deprecated-declarations -Wno-macro-redefined \
-  src/simkl.c src/js.c tests/simkl_cw.c -o "$tmp/simkl_cw" -lpthread
+  src/simkl.c src/js.c src/traktscrobble.c tests/simkl_cw.c -o "$tmp/simkl_cw" -lpthread
 "$tmp/simkl_cw"

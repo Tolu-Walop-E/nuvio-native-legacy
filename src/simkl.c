@@ -8,11 +8,14 @@
 #include "js.h"
 #include "idioma.h"
 #include "trakt.h"
+#include "traktscrobble.h"
+#include "descoberta.h"
 #include "artemetahub.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 
 #define SMK_API "https://api.simkl.com"
 // Retomada: o mesmo teto da fileira (CONT_MAX de descoberta.c) com folga para
@@ -21,6 +24,11 @@
 // Plan to Watch conhecido, para a guarda do "-". 400 ids x 24 B = ~10 KB; a
 // lista de "quero ver" de uma pessoa real cabe com sobra.
 #define SMK_PTW_MAX 400
+#define SMK_ANIME_BUSCAS_MAX 24
+#define SMK_ANIME_CACHE_MAX 24
+#define SMK_ANIME_CORPO_MAX (512u * 1024u)
+#define SMK_ANIME_TTL (7 * 24 * 60 * 60)
+#define SMK_ANIME_ERRO_TTL 30
 
 int simkl_ativo(void) { return simklauth_token()[0] != 0; }
 
@@ -225,6 +233,98 @@ int simkl_ler_assistindo(const char *json, CatItem *dst, int max) {
   return n;
 }
 
+static int inteiroExato(const char *s, char prefixo, int *valor) {
+  char *fim;
+  long v;
+  if (!s || *s != prefixo || !s[1]) return 0;
+  v = strtol(s + 1, &fim, 10);
+  if (*fim || v <= 0 || v > 1000000) return 0;
+  *valor = (int)v;
+  return 1;
+}
+
+// Anime e um vetor separado na resposta de all-items. Guarda os mais recentes
+// mesmo quando a API nao vier ordenada; so depois a camada de rede busca os
+// mappings dos candidatos que realmente podem disputar a fileira.
+int simkl_ler_anime_assistindo(const char *json, SimklAnimeProx *dst, int max) {
+  const char *p;
+  int n = 0;
+  if (!json || !dst || max <= 0) return 0;
+  for (p = js_array(json, NULL, "anime"); p && *p == '{'; p = js_prox(js_fim(p))) {
+    const char *f = js_fim(p), *oi, *of, *ii, *ifim;
+    SimklAnimeProx c;
+    char imdb[24], prox[16] = "", quando[40] = "";
+    int alvo, absoluto = 0;
+    memset(&c, 0, sizeof c);
+    if (!js_texto_raiz_em(p, f, "next_to_watch", prox, sizeof prox) ||
+        !inteiroExato(prox, 'E', &absoluto)) continue;
+    // A resposta real de all-items chama a obra de `show`; versoes antigas e
+    // exemplos anime-native usam `anime`. Aceitar ambos sem procurar por nome.
+    if (!objetoRaiz(p, f, "show", &oi, &of) &&
+        !objetoRaiz(p, f, "anime", &oi, &of)) continue;
+    if (!lerObra(oi, of, &c.item, imdb, sizeof imdb)) continue;
+    if (!objetoRaiz(oi, of, "ids", &ii, &ifim)) continue;
+    c.simklId = (long long)js_num(ii, ifim, "simkl", 0.0);
+    if (c.simklId <= 0) continue;
+    c.absoluto = absoluto;
+    c.item.progresso = 0;
+    snprintf(c.item.imdb, sizeof c.item.imdb, "%s", imdb);
+    snprintf(c.item.tipo, sizeof c.item.tipo, "series");
+    if (js_texto_raiz_em(p, f, "last_watched_at", quando, sizeof quando))
+      c.item.retomadoMs = js_ms_iso(quando);
+    if (n < max) alvo = n++;
+    else {
+      int i, velho = 0;
+      for (i = 1; i < n; i++)
+        if (dst[i].item.retomadoMs < dst[velho].item.retomadoMs) velho = i;
+      if (c.item.retomadoMs <= dst[velho].item.retomadoMs) continue;
+      alvo = velho;
+    }
+    dst[alvo] = c;
+  }
+  // Buscar mapping na ordem de utilidade: se o teto de chamadas for atingido,
+  // os itens mais recentes tiveram prioridade e os seguintes ficam para outra
+  // rodada, sem deslocar um card novo por causa da ordem da resposta.
+  { int a, b;
+    for (a = 1; a < n; a++) {
+      SimklAnimeProx t = dst[a];
+      for (b = a - 1; b >= 0 && dst[b].item.retomadoMs < t.item.retomadoMs; b--)
+        dst[b + 1] = dst[b];
+      dst[b + 1] = t;
+    } }
+  return n;
+}
+
+int simkl_ler_mapa_anime(const char *json, int absoluto, int *temporada, int *episodio) {
+  const char *p;
+  int achou = 0, tFinal = 0, eFinal = 0;
+  if (!json || absoluto <= 0 || !temporada || !episodio) return 0;
+  for (p = js_raiz_array(json); p && *p == '{'; p = js_prox(js_fim(p))) {
+    const char *f = js_fim(p), *vi, *vf, *ti, *tf;
+    char tipo[20] = "";
+    int numero, t, e;
+    if (!valorRaiz(p, f, "episode", &vi, &vf)) continue;
+    numero = atoi(vi);
+    if (numero != absoluto) continue;
+    // O array real pode ter `episode:3` DUAS vezes: uma entrada regular e um
+    // special 3. next_to_watch E3 significa a regular. Specials sem mapping
+    // nao tornam a entrada regular ambigua; duas regulares conflitantes sim.
+    if (js_texto_raiz_em(p, f, "type", tipo, sizeof tipo) && strcmp(tipo, "episode"))
+      continue;
+    // Toda entrada correspondente precisa ter o mesmo mapping positivo. Uma
+    // duplicata sem mapping ou com outro mapping e ambigua: nao arriscamos.
+    if (!objetoRaiz(p, f, "tvdb", &ti, &tf)) return 0;
+    t = (int)js_num(ti, tf, "season", 0.0);
+    e = (int)js_num(ti, tf, "episode", 0.0);
+    if (t <= 0 || e <= 0) return 0; // S0 ainda nao e tocavel com seguranca.
+    if (achou && (t != tFinal || e != eFinal)) return 0;
+    tFinal = t; eFinal = e; achou = 1;
+  }
+  if (!achou) return 0;
+  *temporada = tFinal; *episodio = eFinal;
+  return 1;
+}
+
 int simkl_ler_plantowatch(const char *json, int serie, CatItem *dst, int max) {
   const char *p;
   int n = 0;
@@ -316,7 +416,8 @@ int simkl_corpo_historico_eps(char *dst, size_t tam, const char *imdb,
   if (!dst || !tam || !pares || qtd < 1 || !baseImdb(imdb, id, sizeof id)) return 0;
   if (qtd > SMK_LOTE_MAX) qtd = SMK_LOTE_MAX;
   memset(feita, 0, sizeof feita);
-  { int w = snprintf(dst, tam, "{\"shows\":[{\"ids\":{\"imdb\":\"%s\"},\"seasons\":[", id);
+  { int w = snprintf(dst, tam, "{\"shows\":[{\"ids\":{\"imdb\":\"%s\"},"
+                     "\"use_tvdb_anime_seasons\":true,\"seasons\":[", id);
     if (w < 0 || (size_t)w >= tam) return 0;
     u = (size_t)w; }
   // AGRUPA POR TEMPORADA sem assumir ordem, como trakt_episodios_marcar: o
@@ -445,17 +546,50 @@ static int nPtw;
 // listas lidas aqui (watching, plantowatch) sao pequenas, e o incremental
 // exigiria guardar e fundir o estado entre arranques.
 static unsigned long assCw, assPtw;
-static char *corpoPlay, *corpoAssist, *corpoPtwFilmes, *corpoPtwSeries;
+static char *corpoPlay, *corpoAssist, *corpoAssistAnime, *corpoPtwFilmes, *corpoPtwSeries;
+
+// Cache de respostas completas por OBRA Simkl. Assim a passagem E12 -> E13
+// reutiliza a mesma tabela sem um GET novo. O limite de entradas e de bytes
+// deixa o custo previsivel inclusive para anime longo. `carregando` + condicao
+// deduplicam duas montagens simultaneas da mesma obra.
+typedef struct {
+  long long id;
+  char *corpo;
+  time_t expira;
+  unsigned long uso;
+  int carregando;
+} AnimeCache;
+static AnimeCache animeCache[SMK_ANIME_CACHE_MAX];
+static pthread_mutex_t animeTrava = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t animeCond = PTHREAD_COND_INITIALIZER;
+static unsigned long animeUso;
+
+static pthread_mutex_t travaScr = PTHREAD_MUTEX_INITIALIZER;
+static ScrobbleEstado scrEstado;
+static struct { int acao; char id[64]; double pct; int tem; } scrPend;
+static int scrFioVivo;
 
 static void trocar(char **dst, char *novo) { free(*dst); *dst = novo; }
 
 void simkl_esquecer(void) {
+  int i;
   pthread_mutex_lock(&trava);
   nPlay = nProx = nPtw = 0;
   assCw = assPtw = 0;
-  trocar(&corpoPlay, NULL); trocar(&corpoAssist, NULL);
+  trocar(&corpoPlay, NULL); trocar(&corpoAssist, NULL); trocar(&corpoAssistAnime, NULL);
   trocar(&corpoPtwFilmes, NULL); trocar(&corpoPtwSeries, NULL);
   pthread_mutex_unlock(&trava);
+  pthread_mutex_lock(&animeTrava);
+  for (i = 0; i < SMK_ANIME_CACHE_MAX; i++) {
+    free(animeCache[i].corpo);
+    memset(&animeCache[i], 0, sizeof animeCache[i]);
+  }
+  pthread_cond_broadcast(&animeCond);
+  pthread_mutex_unlock(&animeTrava);
+  pthread_mutex_lock(&travaScr);
+  memset(&scrEstado, 0, sizeof scrEstado);
+  scrPend.tem = 0;
+  pthread_mutex_unlock(&travaScr);
 }
 
 static unsigned long atividades(void) {
@@ -464,6 +598,75 @@ static unsigned long atividades(void) {
   unsigned long h = assinar(r);
   free(r);
   return h;
+}
+
+// Devolve corpo mallocado. `permitirRede=0` faz apenas consulta de cache;
+// `usouRede` conta chamadas reais para o teto por rodada.
+static char *episodiosAnime(long long id, int permitirRede, int *usouRede) {
+  AnimeCache *e = NULL;
+  char caminho[80], *r;
+  time_t agora;
+  int st = 0, i, alvo = -1;
+  if (usouRede) *usouRede = 0;
+  if (id <= 0) return NULL;
+  pthread_mutex_lock(&animeTrava);
+  for (;;) {
+    agora = time(NULL);
+    e = NULL;
+    for (i = 0; i < SMK_ANIME_CACHE_MAX; i++)
+      if (animeCache[i].id == id) { e = &animeCache[i]; break; }
+    if (e && e->carregando) {
+      pthread_cond_wait(&animeCond, &animeTrava);
+      continue;
+    }
+    if (e && e->expira > agora) {
+      char *c = e->corpo ? strdup(e->corpo) : NULL;
+      e->uso = ++animeUso;
+      pthread_mutex_unlock(&animeTrava);
+      return c;
+    }
+    if (!permitirRede) { pthread_mutex_unlock(&animeTrava); return NULL; }
+    if (e) alvo = (int)(e - animeCache);
+    else {
+      for (i = 0; i < SMK_ANIME_CACHE_MAX; i++)
+        if (!animeCache[i].id && !animeCache[i].carregando) { alvo = i; break; }
+      if (alvo < 0) {
+        for (i = 0; i < SMK_ANIME_CACHE_MAX; i++)
+          if (!animeCache[i].carregando &&
+              (alvo < 0 || animeCache[i].uso < animeCache[alvo].uso)) alvo = i;
+      }
+    }
+    if (alvo < 0) { pthread_mutex_unlock(&animeTrava); return NULL; }
+    e = &animeCache[alvo];
+    free(e->corpo); e->corpo = NULL;
+    e->id = id; e->expira = 0; e->uso = ++animeUso; e->carregando = 1;
+    break;
+  }
+  pthread_mutex_unlock(&animeTrava);
+
+  if (usouRede) *usouRede = 1;
+  snprintf(caminho, sizeof caminho, "/anime/episodes/%lld", id);
+  r = pegar(caminho, NULL, &st);
+
+  pthread_mutex_lock(&animeTrava);
+  // A entrada fica reservada enquanto carregando, portanto continua sendo a
+  // nossa. Um erro ganha apenas 30 s de repouso; mapping ausente em resposta
+  // valida fica no corpo por 7 dias e nao martela a API a cada home.
+  if (e->id != id || !e->carregando) {
+    pthread_mutex_unlock(&animeTrava);
+    free(r);
+    return NULL;
+  }
+  if (r && strlen(r) <= SMK_ANIME_CORPO_MAX) {
+    e->corpo = strdup(r);
+    e->expira = time(NULL) + SMK_ANIME_TTL;
+  } else {
+    e->expira = time(NULL) + SMK_ANIME_ERRO_TTL;
+  }
+  e->carregando = 0;
+  pthread_cond_broadcast(&animeCond);
+  pthread_mutex_unlock(&animeTrava);
+  return r;
 }
 
 int simkl_e_a_seguir(const char *id) {
@@ -482,10 +685,11 @@ static int mesmaSerie(const char *a, const char *b) {
 
 int simkl_continuar(CatItem *saida, int max) {
   CatItem *prox;
+  SimklAnimeProx *anime;
   long long ids[SMK_PLAY_MAX];
   unsigned long h;
-  char *cPlay = NULL, *cAssist = NULL;
-  int n, nP, i, k;
+  char *cPlay = NULL, *cAssist = NULL, *cAnime = NULL;
+  int n, nP, nA, nAMapeado = 0, buscasAnime = 0, i, k;
   if (!saida || max <= 0) return 0;
   if (!simkl_ativo()) {
     pthread_mutex_lock(&trava); nPlay = nProx = 0; pthread_mutex_unlock(&trava);
@@ -495,22 +699,25 @@ int simkl_continuar(CatItem *saida, int max) {
 
   h = atividades();
   pthread_mutex_lock(&trava);
-  if (h && h == assCw && corpoPlay && corpoAssist) {
+  if (h && h == assCw && corpoPlay && corpoAssist && corpoAssistAnime) {
     cPlay = strdup(corpoPlay);
     cAssist = strdup(corpoAssist);
+    cAnime = strdup(corpoAssistAnime);
   }
   pthread_mutex_unlock(&trava);
-  if (!cPlay || !cAssist) {
+  if (!cPlay || !cAssist || !cAnime) {
     int st = 0;
-    free(cPlay); free(cAssist);
+    free(cPlay); free(cAssist); free(cAnime);
     cPlay = pegar("/sync/playback", NULL, &st);
     cAssist = pegar("/sync/all-items/shows/watching", NULL, &st);
+    cAnime = pegar("/sync/all-items/anime/watching", "next_watch_info=yes", &st);
     pthread_mutex_lock(&trava);
-    // So guarda o par inteiro: meia resposta valendo como "nada mudou" ate a
+    // So guarda o trio inteiro: meia resposta valendo como "nada mudou" ate a
     // proxima atividade seria uma fileira desfalcada por horas.
-    if (h && cPlay && cAssist) {
+    if (h && cPlay && cAssist && cAnime) {
       trocar(&corpoPlay, strdup(cPlay));
       trocar(&corpoAssist, strdup(cAssist));
+      trocar(&corpoAssistAnime, strdup(cAnime));
       assCw = h;
     } else assCw = 0;
     pthread_mutex_unlock(&trava);
@@ -536,6 +743,7 @@ int simkl_continuar(CatItem *saida, int max) {
   // No heap e so durante a montagem: 64 CatItem sao ~1 MB, e isto roda uma
   // vez por ciclo de descoberta.
   prox = (CatItem *)malloc(sizeof(CatItem) * SMK_PLAY_MAX);
+  anime = (SimklAnimeProx *)malloc(sizeof(SimklAnimeProx) * SMK_PLAY_MAX);
   nP = prox ? simkl_ler_assistindo(cAssist, prox, SMK_PLAY_MAX) : 0;
   for (k = 0; k < nP; k++) {
     int ja = 0, alvo;
@@ -554,9 +762,56 @@ int simkl_continuar(CatItem *saida, int max) {
       snprintf(proxIds[nProx++], sizeof proxIds[0], "%s", prox[k].imdb);
     pthread_mutex_unlock(&trava);
   }
+
+  // Anime entra na MESMA disputa cronologica, mas so depois de uma conversao
+  // exata da obra Simkl + E absoluto para TVDB S/E. Uma serie ja pausada e
+  // descartada antes do GET. Cache hits nao contam para o teto de 24 chamadas.
+  nA = anime ? simkl_ler_anime_assistindo(cAnime, anime, SMK_PLAY_MAX) : 0;
+  for (k = 0; k < nA; k++) {
+    char *mapa;
+    char imdbBase[sizeof anime[k].item.imdb];
+    int ja = 0, alvo, t = 0, e = 0, usouRede = 0;
+    for (i = 0; i < n && !ja; i++) ja = mesmaSerie(saida[i].imdb, anime[k].item.imdb);
+    if (ja) continue;
+    // Mapping nao altera o carimbo. Se a fileira de candidatos ja esta cheia
+    // e este anime nao pode vencer nem o mais velho, nao gaste um GET para
+    // descobrir S/E de um item que sera descartado de qualquer maneira.
+    if (n >= max) {
+      int vel = 0;
+      for (i = 1; i < n; i++) if (saida[i].retomadoMs < saida[vel].retomadoMs) vel = i;
+      if (saida[vel].retomadoMs >= anime[k].item.retomadoMs) continue;
+    }
+    mapa = episodiosAnime(anime[k].simklId, buscasAnime < SMK_ANIME_BUSCAS_MAX, &usouRede);
+    if (usouRede) buscasAnime++;
+    if (!mapa || !simkl_ler_mapa_anime(mapa, anime[k].absoluto, &t, &e)) {
+      free(mapa);
+      continue;
+    }
+    free(mapa);
+    anime[k].item.temporada = t;
+    anime[k].item.episodio = e;
+    snprintf(imdbBase, sizeof imdbBase, "%s", anime[k].item.imdb);
+    snprintf(anime[k].item.imdb, sizeof anime[k].item.imdb, "%.*s:%d:%d",
+             (int)strcspn(imdbBase, ":"), imdbBase, t, e);
+    if (n < max) alvo = n++;
+    else {
+      int vel = 0;
+      for (i = 1; i < n; i++) if (saida[i].retomadoMs < saida[vel].retomadoMs) vel = i;
+      if (saida[vel].retomadoMs >= anime[k].item.retomadoMs) continue;
+      alvo = vel;
+    }
+    saida[alvo] = anime[k].item;
+    nAMapeado++;
+    pthread_mutex_lock(&trava);
+    if (nProx < SMK_PLAY_MAX)
+      snprintf(proxIds[nProx++], sizeof proxIds[0], "%s", anime[k].item.imdb);
+    pthread_mutex_unlock(&trava);
+  }
   free(prox);
+  free(anime);
   free(cPlay);
   free(cAssist);
+  free(cAnime);
 
   // Mais recente primeiro: e a ordem em que a fileira corta.
   { int a, b;
@@ -565,13 +820,122 @@ int simkl_continuar(CatItem *saida, int max) {
       for (b = a - 1; b >= 0 && saida[b].retomadoMs < t.retomadoMs; b--) saida[b + 1] = saida[b];
       saida[b + 1] = t;
     } }
-  printf("[simkl] retomada: %d pausado(s) + %d a seguir candidato(s) -> %d\n",
-         nPlay, nP, n);
+  printf("[simkl] retomada: %d pausado(s) + %d serie(s) + %d/%d anime mapeado(s), "
+         "%d GET mapping -> %d\n", nPlay, nP, nAMapeado, nA, buscasAnime, n);
   fflush(stdout);
   // A arte e o texto sao buscados por montarContinuar SOMENTE depois do corte
   // visivel. Enfeitar os 64 candidatos aqui faria dezenas de GETs para itens
   // que nunca chegam a fileira.
   return n;
+}
+
+// --- scrobble ---------------------------------------------------------------
+
+static int enviarScrobble(int acao, const char *id, double pct) {
+  char corpo[400], caminho[64], *r;
+  int st = 0, ok;
+  scrobble_corpo(corpo, sizeof corpo, id, pct);
+  snprintf(caminho, sizeof caminho, "/scrobble/%s", scrobble_nome(acao));
+  r = pedir('P', caminho, NULL, corpo, &st);
+  ok = (st >= 200 && st < 300) || st == 409;
+  printf("[simkl] %s %s %.1f%% -> %s (HTTP %d)\n",
+         scrobble_nome(acao), id, pct, ok ? "ok" : "falhou", st);
+  fflush(stdout);
+  free(r);
+  if (!ok && acao == SCR_STOP) {
+    // Stop e o unico evento que fecha historico. Se o endpoint de scrobble
+    // falhar, usa o endpoint de history ja comprovado pelo app; assim excluir
+    // o segundo envio no player nao transforma uma falha transitoria em perda.
+    char base[64], *dp;
+    int t = 0, e = 0;
+    snprintf(base, sizeof base, "%s", id);
+    dp = strchr(base, ':');
+    if (dp) { sscanf(dp + 1, "%d:%d", &t, &e); *dp = 0; }
+    if (t > 0 && e > 0) {
+      VistoPar par = { (short)t, (short)e };
+      ok = simkl_episodios_marcar(base, &par, 1, 1);
+    } else {
+      ok = simkl_titulo_marcar(base, "movie", NULL, 0, 1);
+    }
+  }
+  if (ok && (acao == SCR_PAUSE || acao == SCR_STOP)) {
+    // O /sync/activities pode demorar alguns segundos para refletir a escrita.
+    // Forcar uma leitura impede o corpo antigo de sobreviver pela assinatura.
+    pthread_mutex_lock(&trava); assCw = 0; pthread_mutex_unlock(&trava);
+  }
+  // A primeira remontagem ao sair do player pode correr antes do POST. Quando
+  // o stop termina, pede UMA segunda rodada (descoberta coalesce pedidos) para
+  // que o novo next-up apareca sem reiniciar o app ou abrir o site do Simkl.
+  if (ok && acao == SCR_STOP) desc_refazer_continuar();
+  return ok;
+}
+
+static void *fioScrobble(void *u) {
+  (void)u;
+  for (;;) {
+    int acao; char id[64]; double pct;
+    pthread_mutex_lock(&travaScr);
+    if (!scrPend.tem) { scrFioVivo = 0; pthread_mutex_unlock(&travaScr); return NULL; }
+    acao = scrPend.acao; pct = scrPend.pct;
+    snprintf(id, sizeof id, "%s", scrPend.id);
+    scrPend.tem = 0;
+    pthread_mutex_unlock(&travaScr);
+    enviarScrobble(acao, id, pct);
+  }
+}
+
+static int decidirScrobbleSimkl(ScrobbleEstado *s, int evento,
+                                const char *id, double pct) {
+  int mesmo;
+  if (!id || !*id) return SCR_NADA;
+  mesmo = !strcmp(s->id, id);
+  if (evento == SCR_EV_TOCANDO) {
+    if (s->ativo && mesmo) return SCR_NADA;
+    snprintf(s->id, sizeof s->id, "%s", id);
+    s->ativo = 1;
+    return SCR_START;
+  }
+  if (evento == SCR_EV_PAUSOU) {
+    if (!s->ativo || !mesmo) return SCR_NADA;
+    s->ativo = 0;
+    return pct >= 1.0 ? SCR_PAUSE : SCR_NADA;
+  }
+  if (evento == SCR_EV_SAIU) {
+    snprintf(s->id, sizeof s->id, "%s", id);
+    s->ativo = 0;
+    if (pct >= 90.0) return SCR_STOP;
+    return pct >= 1.0 ? SCR_PAUSE : SCR_NADA;
+  }
+  return SCR_NADA;
+}
+
+int simkl_scrobble(int evento, const char *imdb, double posSeg, double durSeg) {
+  int acao;
+  double pct;
+  pthread_t t;
+  if (!simkl_ativo() || !imdb || !*imdb || durSeg <= 1.0) return SCR_NADA;
+  pct = 100.0 * posSeg / durSeg;
+  pthread_mutex_lock(&travaScr);
+  acao = decidirScrobbleSimkl(&scrEstado, evento, imdb, pct);
+  if (acao != SCR_NADA) {
+    scrPend.acao = acao; scrPend.pct = pct; scrPend.tem = 1;
+    snprintf(scrPend.id, sizeof scrPend.id, "%s", imdb);
+    if (!scrFioVivo) {
+      scrFioVivo = 1;
+      if (pthread_create(&t, NULL, fioScrobble, NULL) != 0) {
+        scrFioVivo = 0;
+        scrPend.tem = 0;
+        acao = SCR_NADA; // player mantem o fallback normal de /sync/history
+      }
+      else pthread_detach(t);
+    }
+  }
+  pthread_mutex_unlock(&travaScr);
+  return acao;
+}
+
+int simkl_marcar(const char *imdb, double posSeg, double durSeg) {
+  return simkl_scrobble(SCR_EV_SAIU, imdb, posSeg, durSeg);
 }
 
 int simkl_plantowatch(CatItem *saida, int max) {

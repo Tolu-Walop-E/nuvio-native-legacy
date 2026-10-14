@@ -62,6 +62,7 @@ static void avisarCascaAberto(int v) { (void)v; }
 #endif
 #include "trakt.h"
 #include "traktscrobble.h"
+#include "simkl.h"
 #include "sync.h"
 #include "parental.h"
 #include "plrguia.h"
@@ -1751,8 +1752,10 @@ static void fecharSessao(int manter) {
     // activity (jfid.h). The server got its own stop check-in above.
     if (ci && ci->imdb[0] && !jfid_e(ci->imdb)) {
       char id[64];
+      int acaoSimkl;
       idTrakt(ci, id, sizeof id);
       trakt_marcar(id, pos, duracaoSeg);
+      acaoSimkl = simkl_marcar(id, pos, duracaoSeg);
       // "ASSISTIU" para os amigos, so quando CONCLUIU e so se ela ligou a
       // atividade (ou os "vistos recentemente" do perfil). Largar aos 8% nao
       // assistiu nada — e nao chega a lugar nenhum.
@@ -1780,6 +1783,10 @@ static void fecharSessao(int manter) {
       // rever um episodio ja visto nao reescreve historico.
       if (concluiu) {
         int dest = visto_destinos() & ~VISTO_TRAKT;
+        // /scrobble/stop ja fecha o episodio no Simkl. Se ele falhar, o
+        // trabalhador de simkl.c cai para /sync/history; nao mandar os dois
+        // no caminho feliz evita dois eventos de conclusao para a mesma obra.
+        if (acaoSimkl == SCR_STOP) dest &= ~VISTO_SIMKL;
         if (epT > 0 && epE > 0) {
           if (vistoep_estado(ci->imdb, epT, epE) != 1) {
             VistoPar par = { (short)epT, (short)epE };
@@ -3259,7 +3266,10 @@ void player_atualizar(float dt, Uint32 agora) {
       if (epT > 0 && epE > 0) snprintf(id, sizeof id, "%.*s:%d:%d", (int)strcspn(cs->imdb,":"), cs->imdb, epT, epE);
       else snprintf(id, sizeof id, "%s", cs->imdb);
       tocouS += dt;
-      if (tocouS >= PLR_SCR_TOCOU_S) trakt_scrobble(SCR_EV_TOCANDO, id, posSeg, duracaoSeg);
+      if (tocouS >= PLR_SCR_TOCOU_S) {
+        trakt_scrobble(SCR_EV_TOCANDO, id, posSeg, duracaoSeg);
+        simkl_scrobble(SCR_EV_TOCANDO, id, posSeg, duracaoSeg);
+      }
     } else {
       // Pausou (ou o video parou de andar): so fala se ha um start em pe.
       if (tocouS > 0.0f && cs && cs->imdb[0] && comVideo && video_pronto() && !ehCanal() &&
@@ -3268,6 +3278,7 @@ void player_atualizar(float dt, Uint32 agora) {
         if (epT > 0 && epE > 0) snprintf(id, sizeof id, "%.*s:%d:%d", (int)strcspn(cs->imdb,":"), cs->imdb, epT, epE);
         else snprintf(id, sizeof id, "%s", cs->imdb);
         trakt_scrobble(SCR_EV_PAUSOU, id, posSeg, duracaoSeg);
+        simkl_scrobble(SCR_EV_PAUSOU, id, posSeg, duracaoSeg);
       }
       tocouS = 0.0f;
     } }

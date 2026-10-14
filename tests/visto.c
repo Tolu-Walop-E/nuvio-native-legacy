@@ -61,6 +61,7 @@ int ajustes_tmdb_cw(void) { return 0; }
 const char *ajustes_tmdb_idioma(void) { return "en-US"; }
 const char *desc_chave_tmdb(void) { return ""; }
 const char *desc_tmdb_idioma(void) { return "pt-BR"; }
+void desc_refazer_continuar(void) { }
 void rede_avisar_401(void (*f)(const char *url)) { (void)f; }
 
 // ---------------------------------------------------------------- rede falsa
@@ -169,7 +170,7 @@ int main(void) {
   assert(nPost == 1 && nRpc == 0);
   assert(!strncmp(post[0].url, "https://api.simkl.com/sync/history?client_id=cid-teste&app-name=nuvio&app-version=", 82));
   assert(!strcmp(post[0].corpo,
-    "{\"shows\":[{\"ids\":{\"imdb\":\"tt0903747\"},\"seasons\":[{\"number\":1,"
+    "{\"shows\":[{\"ids\":{\"imdb\":\"tt0903747\"},\"use_tvdb_anime_seasons\":true,\"seasons\":[{\"number\":1,"
     "\"episodes\":[{\"number\":1},{\"number\":2},{\"number\":3}]}]}]}"));
   zerar();
   assert(visto_episodios_ja("tt0903747", "series", tres, 3, 0, VISTO_SIMKL));

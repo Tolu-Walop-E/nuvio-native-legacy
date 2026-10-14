@@ -43,6 +43,8 @@ const char *i18n(const char *s) { return s; }
 const char *idioma_mes_data(int mes, const char *nomePt) { (void)mes; return nomePt; }
 // O enfeite real vai ao Cinemeta; aqui devolve o lote como veio.
 int trakt_enfeitar_lote(CatItem *saida, int n) { (void)saida; return n; }
+static int refazContinuar;
+void desc_refazer_continuar(void) { refazContinuar++; }
 
 // ---------------------------------------------------------------- rede falsa
 
@@ -83,6 +85,27 @@ static const char *WATCHING =
   "{\"last_watched_at\":\"2024-01-18T21:00:00Z\",\"status\":\"watching\","
   "\"next_to_watch\":\"S01E02\",\"show\":{\"title\":\"Sem imdb\",\"ids\":{\"simkl\":5}}}]}";
 
+static const char *ANIME_WATCHING =
+  "{\"anime\":["
+  "{\"last_watched_at\":\"2024-01-21T22:00:00Z\",\"next_to_watch\":\"E9\","
+  "\"show\":{\"title\":\"One Piece\",\"year\":1999,\"ids\":{\"simkl\":38636,\"imdb\":\"tt0388629\"}}},"
+  "{\"last_watched_at\":\"2024-01-20T22:00:00Z\",\"next_to_watch\":\"E1\","
+  "\"anime\":{\"title\":\"Attack on Titan S3 P2\",\"ids\":{\"simkl\":931899,\"imdb\":\"tt2560140\"}}},"
+  "{\"last_watched_at\":\"2024-01-19T22:00:00Z\",\"next_to_watch\":\"E2\","
+  "\"anime\":{\"title\":\"Anime sem mapa\",\"ids\":{\"simkl\":777,\"imdb\":\"tt7777777\"}}},"
+  "{\"last_watched_at\":\"2024-01-18T22:00:00Z\",\"next_to_watch\":\"E2\","
+  "\"anime\":{\"title\":\"Sem IMDb\",\"ids\":{\"simkl\":778}}},"
+  "{\"last_watched_at\":\"2024-01-17T22:00:00Z\",\"next_to_watch\":\"S01E02\","
+  "\"anime\":{\"title\":\"Formato errado\",\"ids\":{\"simkl\":779,\"imdb\":\"tt7777779\"}}}]}";
+
+static const char *MAP_ONE_PIECE =
+  "[{\"episode\":1,\"tvdb\":{\"season\":1,\"episode\":1}},"
+  "{\"episode\":9,\"tvdb\":{\"season\":2,\"episode\":1}},"
+  "{\"episode\":31,\"tvdb\":{\"season\":3,\"episode\":1}}]";
+static const char *MAP_AOT_S3P2 =
+  "[{\"episode\":1,\"tvdb\":{\"season\":3,\"episode\":13}},"
+  "{\"episode\":2,\"tvdb\":{\"season\":3,\"episode\":14}}]";
+
 static const char *PTW_FILMES =
   "{\"movies\":[{\"added_to_watchlist_at\":\"2024-01-01T00:00:00Z\",\"status\":\"plantowatch\","
   "\"movie\":{\"title\":\"Dune\",\"year\":2021,\"ids\":{\"simkl\":1,\"imdb\":\"tt1160419\"}}}]}";
@@ -92,8 +115,10 @@ static const char *PTW_SERIES =
 
 static char atividades[200] = "{\"all\":\"2024-01-20T21:00:00Z\"}";
 static int batidas[8];   // activities, playback, watching, ptw filmes, ptw series, post, delete, outro
+static int animeWatchingBatidas, mapBatidas;
 static char ultimaRota[64], ultimoCorpo[300], ultimaUrl[700];
 static int  semBearer, comApiKey;
+static int scrobbleStatus = 200;
 
 static void conferirCabecalhos(const char *url, const char *const *cab) {
   int k, bearer = 0;
@@ -129,6 +154,10 @@ char *rede_baixar_st(const char *url, int s, const char *const *cab, int *st) {
   if (!strcmp(r, "/sync/activities"))                   { batidas[0]++; return strdup(atividades); }
   if (!strcmp(r, "/sync/playback"))                     { batidas[1]++; return strdup(PLAYBACK); }
   if (!strcmp(r, "/sync/all-items/shows/watching"))     { batidas[2]++; return strdup(WATCHING); }
+  if (!strcmp(r, "/sync/all-items/anime/watching"))     { animeWatchingBatidas++; return strdup(ANIME_WATCHING); }
+  if (!strcmp(r, "/anime/episodes/38636"))              { mapBatidas++; return strdup(MAP_ONE_PIECE); }
+  if (!strcmp(r, "/anime/episodes/931899"))             { mapBatidas++; return strdup(MAP_AOT_S3P2); }
+  if (!strcmp(r, "/anime/episodes/777"))                { mapBatidas++; return strdup("[{\"episode\":1}]"); }
   if (!strcmp(r, "/sync/all-items/movies/plantowatch")) { batidas[3]++; return strdup(PTW_FILMES); }
   if (!strcmp(r, "/sync/all-items/shows/plantowatch"))  { batidas[4]++; return strdup(PTW_SERIES); }
   batidas[7]++;
@@ -145,7 +174,8 @@ char *rede_postar_st(const char *url, int s, const char *const *cab,
   snprintf(ultimaRota, sizeof ultimaRota, "%s", r);
   snprintf(ultimoCorpo, sizeof ultimoCorpo, "%s", corpo ? corpo : "");
   batidas[5]++;
-  *st = !strcmp(r, "/sync/add-to-list") ? 201 : 200;
+  *st = !strncmp(r, "/scrobble/", 10) ? scrobbleStatus
+      : !strcmp(r, "/sync/add-to-list") ? 201 : 200;
   return strdup("{\"added\":{},\"not_found\":{\"movies\":[],\"shows\":[]}}");
 }
 
@@ -174,6 +204,13 @@ static int esperarEscrita(void) {
   return simkl_lista_estado();
 }
 
+static void esperarPosts(int alvo) {
+  int i;
+  for (i = 0; i < 200 && batidas[5] < alvo; i++) usleep(10000);
+  assert(batidas[5] >= alvo);
+  usleep(20000);
+}
+
 // ---------------------------------------------------------------- casos
 
 static void semVinculo(void) {
@@ -197,6 +234,7 @@ static void semVinculo(void) {
 
 static void leitores(void) {
   CatItem v[12];
+  SimklAnimeProx a[12];
   long long ids[12];
   int n = simkl_ler_playback(PLAYBACK, v, ids, 12);
   assert(n == 4);   // anime so-AniDB e item sem imdb ficam fora
@@ -221,6 +259,29 @@ static void leitores(void) {
   assert(simkl_ler_assistindo("{}", v, 12) == 0);
   OK("watching: next_to_watch \"S02E03\" vira o episodio seguinte com 0%");
 
+  n = simkl_ler_anime_assistindo(ANIME_WATCHING, a, 12);
+  assert(n == 3); // formato SxxExx e item sem IMDb nao sao candidatos seguros
+  assert(a[0].simklId == 38636 && a[0].absoluto == 9);
+  assert(!strcmp(a[0].item.imdb, "tt0388629") && a[0].item.retomadoMs > a[1].item.retomadoMs);
+  assert(a[1].simklId == 931899 && a[1].absoluto == 1);
+  OK("anime watching: E absoluto + id Simkl exato; sem IMDb e formato errado saem");
+
+  { int t = 0, e = 0;
+    assert(simkl_ler_mapa_anime(MAP_AOT_S3P2, 1, &t, &e) && t == 3 && e == 13);
+    assert(simkl_ler_mapa_anime(MAP_ONE_PIECE, 9, &t, &e) && t == 2 && e == 1);
+    assert(simkl_ler_mapa_anime(MAP_ONE_PIECE, 31, &t, &e) && t == 3 && e == 1);
+    assert(simkl_ler_mapa_anime("[{\"episode\":1,\"tvdb\":{\"season\":1,\"episode\":1}},"
+                                "{\"episode\":3,\"tvdb\":{\"season\":1,\"episode\":3}}]", 3, &t, &e));
+    assert(!simkl_ler_mapa_anime("[{\"episode\":2}]", 2, &t, &e));
+    assert(!simkl_ler_mapa_anime("[{\"episode\":1,\"tvdb\":{\"season\":0,\"episode\":1}}]", 1, &t, &e));
+    assert(simkl_ler_mapa_anime("[{\"episode\":1,\"tvdb\":{\"season\":1,\"episode\":7}}]", 1, &t, &e));
+    assert(simkl_ler_mapa_anime("[{\"episode\":3,\"type\":\"episode\",\"tvdb\":{\"season\":1,\"episode\":3}},"
+                                "{\"episode\":3,\"type\":\"special\"}]", 3, &t, &e) && t == 1 && e == 3);
+    assert(!simkl_ler_mapa_anime("[{\"episode\":1,\"tvdb\":{\"season\":1,\"episode\":1}},"
+                                 "{\"episode\":1,\"tvdb\":{\"season\":2,\"episode\":1}}]", 1, &t, &e));
+  }
+  OK("mapping: split cour, One Piece, lacunas e OVA positivo; S0/ausente/conflito falham seguro");
+
   n = simkl_ler_plantowatch(PTW_FILMES, 0, v, 12);
   assert(n == 1 && !strcmp(v[0].imdb, "tt1160419") && v[0].naLista && !strcmp(v[0].tipo, "movie"));
   assert(v[0].poster[0]);   // arte do metahub, sem GET
@@ -233,34 +294,36 @@ static void retomada(void) {
   CatItem v[12];
   int n, i;
   memset(batidas, 0, sizeof batidas);
+  animeWatchingBatidas = mapBatidas = 0;
   n = simkl_continuar(v, 12);
   // 4 pausados + Severance (a seguir). Breaking Bad do watching NAO entra de
   // novo: a serie ja esta pausada no S01E05.
-  assert(n == 5);
+  assert(n == 6); // One Piece E9 -> TVDB S2E1; AOT e deduplicado pelo pausado
   for (i = 0; i < n; i++) assert(strncmp(v[i].imdb, "tt0903747:1:6", 13));
   // Mais recente primeiro, inclusive quando o mais novo veio no FIM do JSON.
   assert(!strcmp(v[0].imdb, "tt9999998"));
-  assert(!strcmp(v[1].imdb, "tt11280740:2:3"));
-  assert(!strcmp(v[2].imdb, "tt1375666"));
+  assert(!strcmp(v[1].imdb, "tt0388629:2:1"));
+  assert(!strcmp(v[2].imdb, "tt11280740:2:3"));
   assert(simkl_e_a_seguir("tt11280740:2:3"));
   assert(!simkl_e_a_seguir("tt1375666"));
   assert(batidas[0] == 1 && batidas[1] == 1 && batidas[2] == 1);
+  assert(animeWatchingBatidas == 1 && mapBatidas == 2); // One Piece + sem mapa; AOT pausado nao faz GET
   assert(!semBearer && !comApiKey);
   OK("retomada: pausados + a seguir, sem repetir serie, mais recente primeiro");
 
   // Atividades iguais: nada de playback nem all-items de novo.
   n = simkl_continuar(v, 12);
-  assert(n == 5 && batidas[0] == 2 && batidas[1] == 1 && batidas[2] == 1);
+  assert(n == 6 && batidas[0] == 2 && batidas[1] == 1 && batidas[2] == 1 && mapBatidas == 2);
   // Atividade nova: rebaixa.
   snprintf(atividades, sizeof atividades, "{\"all\":\"2024-01-21T00:00:00Z\"}");
   n = simkl_continuar(v, 12);
-  assert(n == 5 && batidas[0] == 3 && batidas[1] == 2 && batidas[2] == 2);
+  assert(n == 6 && batidas[0] == 3 && batidas[1] == 2 && batidas[2] == 2 && mapBatidas == 2);
   OK("retomada: /sync/activities igual nao baixa all-items de novo");
 
   // Lista cheia: o "a seguir" mais novo toma o lugar do pausado mais velho.
   n = simkl_continuar(v, 3);
   assert(n == 3 && !strcmp(v[0].imdb, "tt9999998"));
-  assert(!strcmp(v[1].imdb, "tt11280740:2:3"));
+  assert(!strcmp(v[1].imdb, "tt0388629:2:1"));
   for (i = 0; i < n; i++) assert(strcmp(v[i].imdb, "tt2560140:2:3"));   // o de 14/01 saiu
   OK("retomada: com a fileira cheia, o a seguir mais novo substitui o mais velho");
 
@@ -320,6 +383,42 @@ static void maisMenos(void) {
   OK("plantowatch da rede: naLista e a guarda do - conhece o que veio de la");
 }
 
+static void scrobble(void) {
+  memset(batidas, 0, sizeof batidas);
+  assert(simkl_scrobble(SCR_EV_TOCANDO, "tt0388629:2:1", 120, 1200) == SCR_START);
+  esperarPosts(1);
+  assert(!strcmp(ultimaRota, "/scrobble/start"));
+  assert(strstr(ultimoCorpo, "\"show\":{\"ids\":{\"imdb\":\"tt0388629\"}}"));
+  assert(strstr(ultimoCorpo, "\"episode\":{\"season\":2,\"number\":1}"));
+  assert(simkl_scrobble(SCR_EV_TOCANDO, "tt0388629:2:1", 130, 1200) == SCR_NADA);
+  assert(simkl_scrobble(SCR_EV_PAUSOU, "tt0388629:2:1", 130, 1200) == SCR_PAUSE);
+  esperarPosts(2);
+  assert(!strcmp(ultimaRota, "/scrobble/pause"));
+  assert(simkl_scrobble(SCR_EV_TOCANDO, "tt0388629:2:1", 140, 1200) == SCR_START);
+  esperarPosts(3);
+  assert(simkl_marcar("tt0388629:2:1", 1200, 1200) == SCR_STOP);
+  esperarPosts(4);
+  assert(!strcmp(ultimaRota, "/scrobble/stop"));
+  assert(batidas[5] == 4); // stop feliz nao duplica com /sync/history
+  assert(refazContinuar == 1); // reler depois que o servidor aceitou o stop
+  OK("scrobble Simkl: start sem spam, pause, resume e stop com TVDB S/E");
+
+  assert(simkl_marcar("tt0388629:2:2", 1020, 1200) == SCR_PAUSE); // 85%, nao visto
+  esperarPosts(5);
+  assert(!strcmp(ultimaRota, "/scrobble/pause"));
+  OK("scrobble Simkl: sair entre 80-90% salva pause sem marcar visto");
+
+  // Falha do stop cai uma vez para history, com a flag oficial de mapping.
+  scrobbleStatus = 500;
+  assert(simkl_marcar("tt2560140:3:13", 1200, 1200) == SCR_STOP);
+  esperarPosts(7);
+  assert(!strcmp(ultimaRota, "/sync/history"));
+  assert(strstr(ultimoCorpo, "\"use_tvdb_anime_seasons\":true"));
+  assert(refazContinuar == 2);
+  scrobbleStatus = 200;
+  OK("scrobble stop indisponivel: fallback para history sem perder conclusao");
+}
+
 int main(void) {
   char caminho[] = "/tmp/nuvio-simkl-cw-XXXXXX";
   int fd = mkstemp(caminho), salvo = dup(1);
@@ -334,6 +433,7 @@ int main(void) {
   leitores();
   retomada();
   maisMenos();
+  scrobble();
   simkl_esquecer();
   assert(!simkl_na_plantowatch("tt2788316"));
 
