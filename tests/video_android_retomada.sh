@@ -20,7 +20,7 @@ else
 fi
 if [ "${SANITIZE:-0}" = 1 ]; then flags+=(-fsanitize=address,undefined -fno-omit-frame-pointer); fi
 cc "${flags[@]}" -ffunction-sections -fdata-sections tests/video_android_retomada.c \
-  src/capmkv.c src/mkv.c tests/capmkv_stub.c \
+  src/capmkv.c src/mkv.c src/linguas.c tests/capmkv_stub.c \
   $( [ "$(uname)" = Darwin ] && echo -Wl,-dead_strip || echo -Wl,--gc-sections ) \
   -lpthread -lm -o "$dir/test"
 "$dir/test"
