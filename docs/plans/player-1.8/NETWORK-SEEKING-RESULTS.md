@@ -1,8 +1,8 @@
 # Network, seeking and failover implementation results
 
-Date: 14 October 2026  
-Branch: `codex/network-seeking-complete`  
-Base: `17b7769d` (latest `origin/master` when work began)
+Date: 14 October 2026 (measurements), 15 October 2026 (rebased onto `master` on top of #452)
+
+Measurements below were taken with the original implementation (`5e35200b`, based on `17b7769d`). The transport code in this branch is that implementation rebased onto current `master` and #452; the constants, session cache, host budget and retry bounds are unchanged. The measurements were not repeated on the rebased branch.
 
 ## Implemented
 
@@ -10,7 +10,6 @@ Base: `17b7769d` (latest `origin/master` when work began)
 - F2 rejects automatic replacement sources below the failed source's resolution or Dolby Vision level. Candidate ordering still uses the existing automatic ranking.
 - F3 classifies and bounds parallel transport failures. Connect timeout/refusal is tried twice, chunk reads once plus one retry, and exhausted parallel failures bypass Media3's additional retry loop.
 - F4 passes the failed final host to the native core, pauses it for candidate validation, and skips same-URL reconnect after the bounded transport confirmation.
-- A separate `space.nuvio.nativelegacy.rede` test application installs beside production. Provider authority and label are application-specific.
 - `AJ_REDE_MODO` adds device-local `Parallel` and `Single connection` modes. Default remains `Parallel`; neither mode changes source quality, bitrate, or decoder selection.
 - Parallel seeking retains the resolved URL and up to 32 MB of completed chunks for 45 seconds. Same-chunk seeks can reopen without a resolver or range request.
 - Active `HttpURLConnection` objects are disconnected on close; cancellation no longer relies on thread interruption alone.
@@ -21,7 +20,7 @@ Base: `17b7769d` (latest `origin/master` when work began)
 
 ## Shield measurements
 
-These measurements use the owner's NVIDIA Shield and the LAN fault server at `192.168.0.107`. They do not contact TorBox and are transport measurements, not decoder or Internet-CDN benchmarks.
+These measurements used an NVIDIA Shield TV on the same LAN as the local fault server (`tests/rede_faltas_server.py`), driven by the instrumentation test `RedeDeviceTest`. They do not contact any debrid service or Internet CDN: they are transport measurements on a LAN, not decoder or real-CDN benchmarks, and LAN latency is far lower than a distant CDN's.
 
 ### Stage 7 comparison
 
@@ -50,19 +49,18 @@ Parallel's median was 4.0% higher in this short LAN test. Variance is high, so t
 
 ## Decision
 
-Keep `Parallel` as the default and expose `Single connection` as an opt-in device setting. Implement Stages 4–7 because the controlled measurements justified session reuse, real cancellation, host backoff, and larger/lower-depth chunks. Do not implement Stage 8 adaptive switching or Stage 9 OkHttp: the evidence does not justify their complexity, and the owner explicitly deferred OkHttp.
+Keep `Parallel` as the default and expose `Single connection` as an opt-in device setting. Implement Stages 4–7 because the controlled measurements justified session reuse, real cancellation, host backoff, and larger/lower-depth chunks. Do not implement Stage 8 adaptive switching or Stage 9 OkHttp: the evidence does not justify their complexity, and an OkHttp transport is left as a separate decision.
 
-## Verification completed
+## Verification completed (original implementation)
 
-- `assembleRede`: pass for arm64-v8a and armeabi-v7a.
+- Android build (arm64-v8a and armeabi-v7a): pass.
 - Kotlin/JVM transport tests: 6 pass.
 - Shield instrumentation: 3 pass (single/parallel transfer, bounded refusal, warm backward seek).
 - Local fault-server regression: pass.
 - Python syntax checks: pass.
-- APK identity: `space.nuvio.nativelegacy.rede`, version `2.0.5-rede`.
-- Shield package check: both `space.nuvio.nativelegacy` and `space.nuvio.nativelegacy.rede` are installed.
-- `git diff --check`: pass.
+
+Verification of this rebased branch is listed in the pull request.
 
 ## Remaining real-media validation
 
-The transport and failure paths are tested, but a logged-in, ordinary-viewing pass is still required for the media-specific gates: five minutes each of Dolby Vision MKV, Dolby Vision MP4 and TrueHD passthrough; normal and rapid seeks; and a 30-minute viewing session. Those checks require the owner's account/addons and real media and must not be replaced with synthetic claims. Production package data was not touched.
+The transport and failure paths are tested, but a logged-in, ordinary-viewing pass is still required for the media-specific gates: five minutes each of Dolby Vision MKV, Dolby Vision MP4 and TrueHD passthrough; normal and rapid seeks; and a 30-minute viewing session. Those checks need a real debrid account, addons and real media, and must not be replaced with synthetic claims.
