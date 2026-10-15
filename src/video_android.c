@@ -347,7 +347,9 @@ static unsigned sessao;
 // F07: the player arms the next video_tocar with its cache limit
 // (cacheboost_backend_cache); trailers never arm, so they stay uncached and
 // at 100%. `cacheSessao` survives the reconnection reopens of that video.
-static int bufferPreset, bufferEnviado, redeModo, redeEnviado = -1;
+// rede: como o buffer, so cruza o JNI quando difere do padrao do Kotlin
+// (0 = Paralelo nos dois lados, no mesmo processo).
+static int bufferPreset, bufferEnviado, redeModo, redeEnviado;
 static int cacheArmado = -1, cacheSessao, cacheEnviado, playerSessao;
 static int ganhoEnviado = CB_VOL_NORMAL;
 static int retomadaInicialEstado = -1;
