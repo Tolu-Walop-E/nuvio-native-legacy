@@ -1063,7 +1063,12 @@ object NvPlayer {
                         .setAudioProcessors(arrayOf(r.proc)).build(), r.tap)
             }.setExtensionRendererMode(androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
                 .setEnableDecoderFallback(true)
-            r.fabricaMidia = DefaultMediaSourceFactory(act).setDataSourceFactory(DefaultDataSource.Factory(act, r.origem))
+            // ParaleloDataSource faz as tres tentativas de transporte; nao
+            // empilhar outra rodada invisivel do Loader antes da maquina de
+            // reconexao 3/10/25 s do nucleo.
+            r.fabricaMidia = DefaultMediaSourceFactory(act)
+                .setLoadErrorHandlingPolicy(PoliticaErroParalelo())
+                .setDataSourceFactory(DefaultDataSource.Factory(act, r.origem))
             if (construir) construirPlayer(act, r)
             Log.i(TAG, "[player] buffer preset=$preset min=${minMs / 1000}s max=${maxMs / 1000}s teto=${bytes shr 20}MB preparo=$preparando")
             return r
@@ -1079,7 +1084,6 @@ object NvPlayer {
         r.fioPreparo?.let { builder.setPlaybackLooper(it.looper) }
         r.bandaPreparo?.let { builder.setBandwidthMeter(it) }
         r.p = builder.build()
-        semTravaDeFio(r.p)
         if (liberacoesEmCurso.get() > 0) {
             try { r.p.audioSessionId = androidx.media3.common.util.Util.generateAudioSessionIdV21(act) }
             catch (e: Exception) { Log.w(TAG, "sessao de audio nova: $e") }
@@ -1255,9 +1259,9 @@ object NvPlayer {
             try { if (ana != null) p.removeAnalyticsListener(ana) } catch (e: Exception) { }
             // Esconde sem destruir a superficie (destruir acorda o callback do Media3).
             try { sv?.layoutParams = FrameLayout.LayoutParams(1, 1) } catch (e: Exception) { }
-            liberarEmFundo(p, sv) { recursos?.let { liberarFontePreparo(it) } }
             // A superficie velha fica com o player velho; a proxima abertura cria outra.
             superficie = null
+            liberarEmFundo(p, sv) { recursos?.let { liberarFontePreparo(it) } }
         }
         // F07: the session cache goes with its player (released and deleted
         // off the main thread, after the canceled loaders unwind).
@@ -1271,22 +1275,6 @@ object NvPlayer {
         try { nativeAudioEstado(AudioSyncTap.FMT_NENHUM) } catch (_: UnsatisfiedLinkError) {}
         superficie?.visibility = View.GONE
     }
-
-    // O release roda em outro fio (liberarEmFundo) e o Media3 1.8 lanca se um
-    // fio que nao e o da aplicacao toca o player; o seletor e so do pacote, entao
-    // reflexao. Sem ele (outra versao), o release volta ao fio principal.
-    private fun semTravaDeFio(p: ExoPlayer) {
-        try {
-            val m = p.javaClass.getDeclaredMethod("setThrowsWhenUsingWrongThread", Boolean::class.javaPrimitiveType)
-            m.isAccessible = true
-            m.invoke(p, false)
-            fioLivre = true
-        } catch (e: Throwable) {
-            fioLivre = false
-            Log.w(TAG, "[player] sem destravar o fio do release (volta ao fio principal): $e")
-        }
-    }
-    @Volatile private var fioLivre = false
 
     private fun novaSuperficie(act: Activity) {
         if (superficie != null) return
@@ -1327,14 +1315,14 @@ object NvPlayer {
         }
     }
 
-    // stop+release do player velho fora do fio principal. A SurfaceView so sai
-    // da tela depois: tirar antes dispararia o callback de superficie do
-    // Media3, que espera o fio de reproducao (justo o que esta preso).
+    // Duas fases no applicationLooper: stop primeiro, release depois de o fio
+    // interno consumir a parada. Mesmo quando chamado do main, liberar() volta
+    // antes do trabalho potencialmente lento; nao viola a afinidade do Media3.
     private fun liberarEmFundo(p: ExoPlayer, sv: SurfaceView?, depois: () -> Unit = {}) {
         liberacoesEmCurso.incrementAndGet()
-        val corpo = Runnable {
+        val looper = Handler(p.applicationLooper)
+        val soltar = Runnable {
             val ini = SystemClock.elapsedRealtime()
-            try { p.stop() } catch (e: Exception) { Log.w(TAG, "stop: $e") }
             try { p.release() } catch (e: Exception) { Log.w(TAG, "release: $e") }
             try { depois() } catch (e: Exception) { Log.w(TAG, "release preload source: $e") }
             val ms = SystemClock.elapsedRealtime() - ini
@@ -1345,8 +1333,13 @@ object NvPlayer {
                 if (sv != null && sv !== superficie) (sv.parent as? FrameLayout)?.removeView(sv)
             }
         }
-        if (fioLivre) { val t = Thread(corpo, "nv-release"); t.isDaemon = true; t.start() }
-        else corpo.run()
+        looper.post {
+            try { p.playWhenReady = false } catch (e: Exception) { Log.w(TAG, "pause release: $e") }
+            try { p.stop() } catch (e: Exception) { Log.w(TAG, "stop: $e") }
+            // stop() envia a parada ao fio interno; dar-lhe uma volta evita que
+            // release() espere o decoder ocupado no proprio callback de parar.
+            looper.postDelayed(soltar, 50)
+        }
     }
 
     // Tique de 250 ms: a posicao que o C le sem esperar ninguem.
