@@ -3,6 +3,9 @@ package space.nuvio.nativelegacy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.IOException
@@ -16,6 +19,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class ParaleloDataSourceTest {
+    // TaxaConexao e global (orcamento e pausa por host): cada teste comeca limpo.
+    @Before fun antes() = TaxaConexao.limparTestes()
+    @After fun depois() = TaxaConexao.limparTestes()
+
     private open class ConexaoFalsa(url: URL) : HttpURLConnection(url) {
         val desconectou = AtomicBoolean()
         override fun connect() = Unit
@@ -41,7 +48,8 @@ class ParaleloDataSourceTest {
             },
             dormir = { esperas += it })
 
-        fonte.conectarComRetry(URL("https://example.invalid/video.mkv"), 0, 1023)
+        // O backoff limitado de conectarComRetry, pedido com tres tentativas.
+        fonte.conectarComRetry(URL("https://example.invalid/video.mkv"), 0, 1023, 3)
         fonte.close()
 
         assertEquals(3, aberturas.get())
@@ -49,7 +57,10 @@ class ParaleloDataSourceTest {
         assertTrue(conexoes.take(2).all { it.desconectou.get() })
     }
 
-    @Test fun timeoutDeSocketTambemRecebeTresTentativas() {
+    // A abertura de producao tenta DUAS vezes (TENTATIVAS_ABRIR): o segundo
+    // timeout confirma a falha, pausa o host (TaxaConexao) e a falha sobe com o
+    // host e a classe, sem uma terceira espera.
+    @Test fun timeoutDeSocketConfirmadoPausaOHostEFalhaComClasse() {
         val aberturas = AtomicInteger()
         val esperas = ArrayList<Long>()
         val fonte = ParaleloDataSource(null, emptyMap(),
@@ -64,14 +75,18 @@ class ParaleloDataSourceTest {
             dormir = { esperas += it })
 
         try {
-            fonte.conectarComRetry(URL("https://example.invalid/video.mkv"), 0, 1023)
+            fonte.conectarComRetry(URL("https://example.invalid/video.mkv"), 0, 1023, 2)
+            fail("timeout repetido tem de falhar")
         } catch (e: FalhaDownloadParalelo) {
             assertTrue(e.cause is SocketTimeoutException)
+            assertEquals("example.invalid", e.hostFinal)
+            assertEquals("timeout", e.classeRede)
         }
         finally { fonte.close() }
 
-        assertEquals(3, aberturas.get())
-        assertEquals(listOf(250L, 750L), esperas)
+        assertEquals(2, aberturas.get())
+        assertEquals(listOf(250L), esperas)
+        assertTrue(TaxaConexao.pausado("example.invalid"))
     }
 
     @Test fun closeDesconectaAberturaEmVoo() {
@@ -87,7 +102,7 @@ class ParaleloDataSourceTest {
         val fonte = ParaleloDataSource(null, emptyMap(), novaConexao = { conexao }, dormir = {})
         val terminouComErro = AtomicBoolean()
         val t = Thread {
-            try { fonte.conectarComRetry(conexao.url, 0, 1023) }
+            try { fonte.conectarComRetry(conexao.url, 0, 1023, 2) }
             catch (_: IOException) { terminouComErro.set(true) }
             finally { saiu.countDown() }
         }

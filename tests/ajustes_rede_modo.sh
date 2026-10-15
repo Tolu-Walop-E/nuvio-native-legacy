@@ -15,7 +15,7 @@ else
   read -r -a sdl_flags <<< "$(pkg-config --cflags sdl2 SDL2_image SDL2_ttf)"
   read -r -a sdl_libs <<< "$(pkg-config --libs sdl2 SDL2_image SDL2_ttf)"
   flags+=("${sdl_flags[@]}")
-  libs+=("${sdl_libs[@]}" -lGL)
+  libs+=("${sdl_libs[@]}" -lGL -lm -lpthread)
 fi
 dir=$(mktemp -d "${TMPDIR:-/tmp}/nuvio-aj-rede.XXXXXX")
 trap 'rm -rf "$dir"' EXIT
