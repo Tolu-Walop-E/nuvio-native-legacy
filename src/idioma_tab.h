@@ -3519,6 +3519,7 @@
   { "Para quem?", "To whom?" },
   { "Parado num título, o cartaz cresce e mostra nota do IMDb, ano, classificação e uma seta: subiu, caiu ou é novo na fileira.", "Resting on a title, the poster grows and shows the IMDb rating, year, age rating and an arrow: up, down or new in the row." },
   { "Paralelo", "Parallel" },
+  { "Paralelo usa várias conexões para servidores distantes. Uma conexão reduz pedidos e conexões por busca; use-a quando sustentar a velocidade do arquivo. Não muda a qualidade. Vale a partir do próximo vídeo.", "Parallel uses several connections for distant servers. Single connection reduces requests and connections per seek; use it when one connection keeps up with the file. Does not change quality. Applies from the next video." },
   { "Parar", "Stop" },
   { "Parecidos no seu catálogo", "Similar in your catalogue" },
   { "Parede de filmes e Continuar de cada perfil.", "Movie wall and each profile's Continue." },
