@@ -2960,6 +2960,29 @@ static void perfilAbrirSessao(int antes) {
   perfilSessaoAplicada = perfis_sessao_geracao();
 }
 
+// A ESCOLHA CONFIRMADA ABRE A SESSAO DO PERFIL, de onde quer que ela tenha vindo.
+//
+// O OK num perfil sem PIN conclui a escolha no EVENTO, e o quadro seguinte a
+// encontra aqui logo no comeco. O PIN, nao: a resposta do servidor chega no
+// fio da rede e e consumida DENTRO de perfilsel_atualizar, no meio do quadro.
+// Antes, esse mesmo quadro seguia ate o "concluido -> TELA_HOME" do fim da tela
+// de escolha, e o teste do comeco do quadro (que exige TELA_ESCOLHA_PERFIL)
+// nunca mais via a escolha: perfilAbrirSessao nao rodava para a sessao nova.
+// A descoberta ficava presa na abertura da sessao anterior e recusava, calada,
+// toda volta (descIniciarTravado): a Home nunca pedia o catalogo de addon
+// nenhum (#280: as fileiras do Bingecat). Por isso a mesma checagem roda nos
+// dois pontos. Devolve 1 quando abriu (quem chama encerra o quadro).
+static int abrirEscolhaDePerfil(Uint32 agora) {
+  if (tela != TELA_ESCOLHA_PERFIL || !perfilsel_concluido() ||
+      perfis_sessao_geracao() == perfilSessaoAplicada) return 0;
+  perfilAbrirSessao(perfilAntes);
+  perfilAntes = perfis_ativo();
+  sync_iniciar();
+  trocaPerfilDesde = agora;
+  perfilsel_preparar(1, agora);
+  return 1;
+}
+
 int app_iniciar(const char *dirArte) {
   legenda2_vincular_atraso(ajustes_leg2_atraso(), ajustes_leg2_definir_atraso);
   perfis_ao_abrir_sessao(perfilEncerrarSessao);
@@ -3953,15 +3976,7 @@ void app_atualizar(float dt, Uint32 agora) {
   // A confirmed choice changes identity during input. Reset its modules
   // before polling them, so an outgoing OAuth completion cannot push into
   // the new profile during the first frame after selection.
-  if (tela == TELA_ESCOLHA_PERFIL && perfilsel_concluido() &&
-      perfis_sessao_geracao() != perfilSessaoAplicada) {
-    perfilAbrirSessao(perfilAntes);
-    perfilAntes = perfis_ativo();
-    sync_iniciar();
-    trocaPerfilDesde = agora;
-    perfilsel_preparar(1, agora);
-    return;
-  }
+  if (abrirEscolhaDePerfil(agora)) return;
 
   // Os vinculos de Trakt e Simkl avancam TODO quadro, em qualquer tela: os dois
   // fazem poll. MEDIDO na TV: estas duas linhas viviam dentro do `if` da tela
@@ -3992,6 +4007,8 @@ void app_atualizar(float dt, Uint32 agora) {
     home_atualizar(dt, agora);
     home_oculta(0);
     perfilsel_atualizar(dt, agora);
+    // O PIN conclui a escolha aqui dentro (ver abrirEscolhaDePerfil).
+    if (abrirEscolhaDePerfil(agora)) return;
     if (perfilsel_pediu_repetir()) { sync_iniciar(); return; }
     if (perfilsel_quer_sair()) {
       // Voltar = "segue com quem ja estava". So vale quando ha uma escolha
