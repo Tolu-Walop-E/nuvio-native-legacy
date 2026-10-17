@@ -129,6 +129,8 @@ class ParaleloDataSource(
         const val PEDACO = 4 shl 20           // 4 MB por pedido
         private const val ADIANTE = 3         // pedacos em voo por conexao
         private const val TENTATIVAS = 3
+        // O link do CDN venceu ou nao vale mais (ver renovarDestino).
+        private val RECUSAS_LINK = setOf(401, 403, 404, 410)
         private val ESPERA_TENTATIVA_MS = longArrayOf(250L, 750L)
         // O primeiro pedido e menor: a imagem nao espera 4 MB chegarem.
         private const val PRIMEIRO = 1 shl 20
@@ -183,7 +185,11 @@ class ParaleloDataSource(
     }
 
     private var uri: Uri? = null
-    private var urlFinal: URL? = null
+    // Destino dos pedacos desta abertura; trocado em renovarDestino.
+    @Volatile private var urlFinal: URL? = null
+    // O link do addon desta abertura, para pedir um destino novo.
+    @Volatile private var origem: URL? = null
+    private val travaRenovar = Any()
     private var pos = 0L          // proximo byte a entregar
     private var fim = 0L          // exclusivo
     private var total = C.LENGTH_UNSET.toLong()
@@ -367,7 +373,9 @@ class ParaleloDataSource(
         // Primeiro pedaco pela URL original: segue os redirecionamentos do debrid
         // uma vez so; os pedacos seguintes vao direto ao endereco final. Uma
         // abertura seguinte da mesma sessao ja comeca no destino (DestinosAddon).
-        val c = abrirSonda(URL(dataSpec.uri.toString()), pos, primeiroUltimo)
+        val o = URL(dataSpec.uri.toString())
+        origem = o
+        val c = abrirSonda(o, pos, primeiroUltimo)
         val code = c.responseCode
         if (code == 206) {
             val cr = c.getHeaderField("Content-Range") ?: ""
@@ -488,27 +496,37 @@ class ParaleloDataSource(
     // Mantem ate conexoes * ADIANTE pedacos pedidos a frente da leitura.
     private fun encher() {
         val ex = exec ?: return
-        val u = urlFinal ?: return
+        if (urlFinal == null) return
         while (pedidos.size < conexoes * ADIANTE && proximoPedido < fim) {
             val ini = proximoPedido
             val ult = minOf(fim, ini + pedacoAtual) - 1
-            pedidos[ini] = ex.submit<ByteArray> { baixar(u, ini, ult) }
+            pedidos[ini] = ex.submit<ByteArray> { baixar(ini, ult) }
             proximoPedido = ult + 1
         }
     }
 
-    private fun baixar(u: URL, ini: Long, ult: Long): ByteArray {
+    private fun baixar(ini: Long, ult: Long): ByteArray {
         var ultimoErro: IOException? = null
-        repeat(TENTATIVAS) {
+        var tentativa = 0
+        var renovou = false
+        while (tentativa < TENTATIVAS) {
             conferirCancelamento()
+            val u = urlFinal ?: throw cancelado()
             // Uma conexao paralela ativa, do connect ao ultimo byte. As outras
             // somam no mesmo segundo do medidor; nada e contado duas vezes.
             medidor?.inicio(token)
             Estat.conexoes.incrementAndGet()
             var c: HttpURLConnection? = null
+            var recusado = 0
             try {
                 c = conectar(u, ini, ult)
-                if (c.responseCode != 206) throw IOException("HTTP ${c.responseCode} no pedaco $ini-$ult")
+                val code = c.responseCode
+                // Recusa do CDN (link vencido) ou outro arquivo no lugar (um
+                // CDN vencido pode servir 200 com um clipe de erro).
+                if (code != 206 || (total > 0 && totalDe(c) != total)) {
+                    if (code in RECUSAS_LINK || code in 200..299) recusado = code
+                    throw IOException("HTTP $code no pedaco $ini-$ult")
+                }
                 val d = lerTudo(c)
                 if (d.size.toLong() != ult - ini + 1) throw IOException("pedaco curto: ${d.size} de ${ult - ini + 1}")
                 return d
@@ -520,9 +538,47 @@ class ParaleloDataSource(
                 Estat.conexoes.decrementAndGet()
                 medidor?.fim(token)
             }
-            if (it + 1 < TENTATIVAS) esperarTentativa(it)
+            // Uma renovacao por pedaco, fora da conta das tentativas: o pedaco
+            // espera (o player ve buffer) em vez de a abertura cair.
+            if (recusado != 0 && !renovou) {
+                renovou = true
+                renovarDestino(u, recusado)
+                continue
+            }
+            tentativa++
+            if (tentativa < TENTATIVAS) esperarTentativa(tentativa - 1)
         }
         throw FalhaDownloadParalelo(ultimoErro ?: IOException("pedaco $ini-$ult falhou"))
+    }
+
+    // LINK DO CDN VENCIDO NO MEIO DE UMA ABERTURA. A reproducao continua (e a
+    // retomada depois de uma pausa, que nao abre de novo) pede os pedacos ao
+    // destino resolvido na abertura. Vencido, cada pedaco gastava as tentativas
+    // e a abertura caia: erro no player e a reconexao inteira do nucleo. Agora
+    // o pedaco recusado pede UM destino novo ao link do addon (o mesmo arquivo:
+    // mesmo total) e segue nele; quem chegar depois com o destino velho so
+    // passa a usar o novo. So o primeiro pedaco recusado conversa com o addon.
+    private fun renovarDestino(usada: URL, code: Int) {
+        val o = origem ?: return
+        synchronized(travaRenovar) {
+            if (urlFinal != usada) return   // outro pedaco ja renovou
+            conferirCancelamento()
+            Log.i(TAG, "destino recusou um pedaco (HTTP $code); pedindo outro a ${o.host}")
+            destinos?.esquecer(o.toString())
+            val c = try { conectarComRetry(o, 0L, 0L, 0L) } catch (e: IOException) {
+                if (foiCancelado(e)) throw cancelado(e)
+                Log.w(TAG, "${o.host} nao deu destino novo (${e.javaClass.simpleName})")
+                return
+            }
+            try {
+                val visto = totalDe(c)
+                if (c.responseCode in 200..299 && (total <= 0 || visto == total)) {
+                    urlFinal = c.url
+                    destinos?.lembrar(o.toString(), c.url, visto)
+                    Log.i(TAG, "destino novo: ${c.url.host}, a abertura segue nele")
+                } else Log.w(TAG, "${o.host} respondeu HTTP ${c.responseCode} ($visto bytes); destino mantido")
+            } finally { desconectar(c) }
+        }
     }
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {

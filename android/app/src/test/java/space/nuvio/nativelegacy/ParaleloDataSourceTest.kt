@@ -151,11 +151,16 @@ class ParaleloDataSourceTest {
             assertEquals(0, ParaleloDataSource.Estat.conexoes.get())
             esperas += it
         })
+        // Os pedacos leem o destino da abertura (urlFinal), que renovarDestino
+        // pode trocar; aqui ele e posto a mao, sem abertura.
+        val urlFinal = ParaleloDataSource::class.java.getDeclaredField("urlFinal")
+        urlFinal.isAccessible = true
+        urlFinal.set(fonte, URL("https://example.invalid/video.mkv"))
         val baixar = ParaleloDataSource::class.java.getDeclaredMethod("baixar",
-            URL::class.java, Long::class.javaPrimitiveType, Long::class.javaPrimitiveType)
+            Long::class.javaPrimitiveType, Long::class.javaPrimitiveType)
         baixar.isAccessible = true
         try {
-            val dados = baixar.invoke(fonte, URL("https://example.invalid/video.mkv"), 0L, 3L) as ByteArray
+            val dados = baixar.invoke(fonte, 0L, 3L) as ByteArray
             assertEquals(listOf<Byte>(1, 2, 3, 4), dados.toList())
         } finally { fonte.close() }
         assertEquals(3, aberturas.get())
@@ -478,6 +483,98 @@ class ParaleloDataSourceTest {
         agora = DestinosAddon.VALIDADE_MS
         abrirDois(nova(), 0L)
         assertEquals(2, rede.noAddon.get())
+    }
+
+    // 206 com bytes conferiveis ((pos % 251)) e o total que o teste escolhe.
+    private class ConexaoPadrao(url: URL, private val total: Long) : ConexaoFalsa(url) {
+        private var range = "bytes=0-"
+        override fun setRequestProperty(key: String?, value: String?) { if (key == "Range" && value != null) range = value }
+        private fun ini() = range.removePrefix("bytes=").substringBefore('-').toLong()
+        private fun fim() = range.substringAfter('-', "").let { if (it.isEmpty()) total - 1 else it.toLong() }
+        override fun getResponseCode(): Int = HTTP_PARTIAL
+        override fun getContentLengthLong(): Long = fim() - ini() + 1
+        override fun getHeaderField(name: String?): String? =
+            if (name == "Content-Range") "bytes ${ini()}-${fim()}/$total" else null
+        override fun getInputStream(): InputStream {
+            val i = ini()
+            return ByteArrayInputStream(ByteArray((fim() - i + 1).toInt()) { ((i + it) % 251).toByte() })
+        }
+    }
+
+    private fun lerTudoDe(fonte: ParaleloDataSource, total: Long) {
+        val buf = ByteArray(1 shl 16)
+        var lidos = 0L
+        while (true) {
+            val n = fonte.read(buf, 0, buf.size)
+            if (n == C.RESULT_END_OF_INPUT) break
+            for (i in 0 until n) assertEquals(((lidos + i) % 251).toByte(), buf[i])
+            lidos += n
+        }
+        assertEquals(total, lidos)
+    }
+
+    // Reproducao continua (ou retomada apos pausa) com o link do CDN vencendo
+    // no meio: os pedacos recusados pedem UM destino novo ao addon e a mesma
+    // abertura segue, sem erro e sem gastar as tentativas.
+    @Test fun linkVencidoNoMeioDaAberturaTrocaDeDestinoSemCair() {
+        val total = 40L shl 20
+        val noAddon = AtomicInteger()
+        val noCdn1 = AtomicInteger()
+        val cdn = AtomicReference("https://cdn1.invalid/f?token=a")
+        val fonte = ParaleloDataSource(null, emptyMap(), novaConexao = { url ->
+            when (url.host) {
+                "addon.invalid" -> {
+                    noAddon.incrementAndGet()
+                    val d = cdn.get()
+                    object : ConexaoFalsa(url) {
+                        override fun getResponseCode(): Int = 307
+                        override fun getHeaderField(name: String?): String? = if (name == "Location") d else null
+                    }
+                }
+                // A sonda e dois pedacos passam; dai em diante o link venceu.
+                "cdn1.invalid" -> if (noCdn1.incrementAndGet() <= 3) ConexaoPadrao(url, total) else {
+                    cdn.set("https://cdn2.invalid/f?token=b")
+                    object : ConexaoFalsa(url) { override fun getResponseCode(): Int = HTTP_FORBIDDEN }
+                }
+                else -> ConexaoPadrao(url, total)
+            }
+        }, dormir = { throw AssertionError("a troca de destino nao deve esperar retry") })
+        try {
+            assertEquals(total, fonte.open(DataSpec.Builder()
+                .setUri(android.net.Uri.parse("https://addon.invalid/play/abc")).build()))
+            lerTudoDe(fonte, total)
+        } finally { fonte.close() }
+        assertEquals(2, noAddon.get())   // a abertura e UMA renovacao
+    }
+
+    // O addon devolve outro arquivo (outro total): o destino nao e trocado e
+    // o pedaco falha como antes, pelas tentativas.
+    @Test fun renovacaoQueTrazOutroArquivoNaoTrocaODestino() {
+        val total = 40L shl 20
+        val noCdn1 = AtomicInteger()
+        val cdn = AtomicReference("https://cdn1.invalid/f?token=a")
+        val fonte = ParaleloDataSource(null, emptyMap(), novaConexao = { url ->
+            when (url.host) {
+                "addon.invalid" -> {
+                    val d = cdn.get()
+                    object : ConexaoFalsa(url) {
+                        override fun getResponseCode(): Int = 307
+                        override fun getHeaderField(name: String?): String? = if (name == "Location") d else null
+                    }
+                }
+                "cdn1.invalid" -> if (noCdn1.incrementAndGet() <= 3) ConexaoPadrao(url, total) else {
+                    cdn.set("https://outro.invalid/g")
+                    object : ConexaoFalsa(url) { override fun getResponseCode(): Int = HTTP_FORBIDDEN }
+                }
+                else -> ConexaoPadrao(url, total + 1)
+            }
+        }, dormir = { })
+        var falhou = false
+        try {
+            fonte.open(DataSpec.Builder().setUri(android.net.Uri.parse("https://addon.invalid/play/abc")).build())
+            try { lerTudoDe(fonte, total) } catch (e: IOException) { falhou = true }
+        } finally { fonte.close() }
+        assertTrue(falhou)
     }
 
     @Test fun semRedirecionamentoNadaEGuardado() {
