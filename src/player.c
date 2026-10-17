@@ -4336,8 +4336,9 @@ void player_atualizar(float dt, Uint32 agora) {
     if (cs && (jfid_e(cs->imdb) || !identidadeValida())) cs = NULL;
     if (ok && cs && cs->imdb[0]) {
       char id[64];
-      if (epT >= 0 && epE > 0) snprintf(id, sizeof id, "%.*s:%d:%d", (int)strcspn(cs->imdb,":"), cs->imdb, epT, epE);
-      else snprintf(id, sizeof id, "%s", cs->imdb);
+      // Same id as the exit's: cutting at the first ':' made "kitsu:41370"
+      // episode 5 a "kitsu:1:5", a different title from its own stop.
+      idTrakt(cs, id, sizeof id);
       tocouS += dt;
       if (tocouS >= PLR_SCR_TOCOU_S) {
         scrobbleTrakt(SCR_EV_TOCANDO, cs, posSeg, duracaoSeg, assistidoSeg, 0);
@@ -4355,8 +4356,7 @@ void player_atualizar(float dt, Uint32 agora) {
           duracaoSeg >= 120.0f && !scrubbing &&
           !player_duracao_suspeita((double)duracaoSeg, duracaoCatalogo())) {
         char id[64];
-        if (epT >= 0 && epE > 0) snprintf(id, sizeof id, "%.*s:%d:%d", (int)strcspn(cs->imdb,":"), cs->imdb, epT, epE);
-        else snprintf(id, sizeof id, "%s", cs->imdb);
+        idTrakt(cs, id, sizeof id);
         scrobbleTrakt(SCR_EV_PAUSOU, cs, posSeg, duracaoSeg, assistidoSeg, 0);
         simkl_scrobble(SCR_EV_PAUSOU, id, posSeg, duracaoSeg, assistidoSeg, 0);
         if (!saindo) wsPausou();
