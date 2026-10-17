@@ -516,6 +516,72 @@ int main(void) {
     addonMeta = 0; addonResp = NULL; cineSerie = NULL; nRotas = 0;
     limparCacheMeta();
   }
+  // No metadata add-on: the Nuvio catalog (TMDB) has one 4-episode season,
+  // Cinemeta (IMDb/TVDB, what Simkl and the stream add-ons number by) 2 + 2
+  // and a Special. Cinemeta's list replaces the catalog's, as NuvioTV shows
+  // Cinemeta's. Fewer regular episodes, or the same split, changes nothing.
+  {
+    const char *nuvio = "{\"meta\":{\"name\":\"K8\",\"videos\":["
+      "{\"id\":\"tt4440001:1:1\",\"season\":1,\"episode\":1,\"name\":\"Kafka\"},"
+      "{\"id\":\"tt4440001:1:2\",\"season\":1,\"episode\":2},"
+      "{\"id\":\"tt4440001:1:3\",\"season\":1,\"episode\":3},"
+      "{\"id\":\"tt4440001:1:4\",\"season\":1,\"episode\":4}]}}";
+    const char *cine = "{\"meta\":{\"name\":\"K8\",\"videos\":["
+      "{\"id\":\"tt4440001:0:1\",\"season\":0,\"episode\":1},"
+      "{\"id\":\"tt4440001:1:1\",\"season\":1,\"episode\":1},"
+      "{\"id\":\"tt4440001:1:2\",\"season\":1,\"episode\":2},"
+      "{\"id\":\"tt4440001:2:1\",\"season\":2,\"episode\":1},"
+      "{\"id\":\"tt4440001:2:2\",\"season\":2,\"episode\":2}]}}";
+    const char *curto = "{\"meta\":{\"name\":\"K8\",\"videos\":["
+      "{\"id\":\"tt4440002:1:1\",\"season\":1,\"episode\":1},"
+      "{\"id\":\"tt4440002:2:1\",\"season\":2,\"episode\":1}]}}";
+    const char *nuvio2 = "{\"meta\":{\"name\":\"K9\",\"videos\":["
+      "{\"id\":\"tt4440002:1:1\",\"season\":1,\"episode\":1},"
+      "{\"id\":\"tt4440002:1:2\",\"season\":1,\"episode\":2},"
+      "{\"id\":\"tt4440002:1:3\",\"season\":1,\"episode\":3}]}}";
+    TempsPub tp = {0};
+    char *r;
+    nRotas = 0;
+    rota("cinemeta.strem.io/meta/series/tt4440001.json", cine);
+    rota("cinemeta.strem.io/meta/series/tt4440002.json", curto);
+    rota("cinemeta.strem.io/meta/series/tt4440003.json", nuvio2);
+    catalogoCom("tt4440001", "series", "Cinemeta split");
+    snprintf(epAlvoId, sizeof epAlvoId, "%s", "tt4440001");
+    EpPedido p = { .item = 0, .geracao = epGeracao };
+    strcpy(p.id, "tt4440001");
+    pthread_once(&epPedidoOnce, epPedidoKeyCriar);
+    pthread_setspecific(epPedidoKey, &p);
+    assert(publicarEpisodios(nuvio, 0, "Cinemeta split", NULL, 0, &tp) == 4);
+    r = splitDoCinemeta(0, "tt4440001", "Cinemeta split", nuvio, &tp);
+    assert(r);
+    free(r);
+    assert(cat_n_episodios(0) == 5);
+    assert(tp.n == 3);                                       // S1, S2 and Specials
+    { int s1e1 = 0, s2 = 0;
+      for (int i = 0; i < 5; i++) {
+        const CatEp *e = cat_episodio(0, i);
+        assert(!(e->temporada == 1 && e->episodio > 2));   // no S1E3-4 left
+        if (e->temporada == 1 && e->episodio == 1)
+          s1e1 = !strcmp(e->nome, "Kafka");                // the catalog's text fills in
+        if (e->temporada == 2) s2++;
+      }
+      assert(s1e1 && s2 == 2); }
+    pthread_setspecific(epPedidoKey, NULL);
+    // Cinemeta knows fewer regular episodes: the catalog's list stays.
+    catalogoCom("tt4440002", "series", "Cinemeta short");
+    snprintf(epAlvoId, sizeof epAlvoId, "%s", "tt4440002");
+    strcpy(p.id, "tt4440002");
+    pthread_setspecific(epPedidoKey, &p);
+    assert(publicarEpisodios(nuvio2, 0, "Cinemeta short", NULL, 0, &tp) == 3);
+    assert(!splitDoCinemeta(0, "tt4440002", "Cinemeta short", nuvio2, &tp));
+    assert(cat_n_episodios(0) == 3);
+    // Same split (Cinemeta answers what the catalog had): nothing to do.
+    assert(!splitDoCinemeta(0, "tt4440003", "Same split", nuvio2, &tp));
+    // Not an IMDb id: never asked.
+    assert(!splitDoCinemeta(0, "tmdb:t1", "Not IMDb", nuvio2, &tp));
+    pthread_setspecific(epPedidoKey, NULL);
+    nRotas = 0;
+  }
   // Samsung 2.0.4: One Piece renumerado por um addon de fontes.
   {
     size_t cap = 2u << 20, k;

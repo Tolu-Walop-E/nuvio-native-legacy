@@ -7639,6 +7639,56 @@ static int publicarEpisodiosSubstituir(const char *corpo, int alvoItem,
                                      0, 1);
 }
 
+// Distinct episodes outside the Specials season (0), and the eps parsed.
+static int epsRegulares(const char *corpo, CatEp *eps, int *n) {
+  int i, r = 0;
+  *n = parsearEpisodios(corpo, eps, VIDEOS_MAX);
+  for (i = 0; i < *n; i++) if (eps[i].temporada > 0) r++;
+  return r;
+}
+
+// Cinemeta's list for an IMDb series whose page shows the Nuvio catalog's.
+// Publishes it (replacing, with the Nuvio text filling what it lacks) when
+// its regular seasons are split differently and it knows at least as many
+// regular episodes; returns its body (caller frees) when it did, NULL
+// otherwise. Kaiju No. 8: the catalog has one 23-episode season, Cinemeta
+// 12 + 11 + 6 plus 6 Specials.
+static char *splitDoCinemeta(int alvoItem, const char *serie, const char *titulo,
+                             const char *corpoNuvio, TempsPub *tp) {
+  char chave[96], *cine;
+  CatEp *a, *b;
+  int na = 0, nb = 0, ra = 0, rb = 0, troca = 0, i;
+  if (!serie || strncmp(serie, "tt", 2) || ajustes_meta_so_cinemeta()) return NULL;
+  snprintf(chave, sizeof chave, "cinemeta-split/series/%s", serie);
+  cine = metaCacheObter(chave);
+  if (!cine) {
+    cine = metaprov_meta_cinemeta_com("series", serie, 8, NULL, NULL);
+    if (!cine) return NULL;
+    metaCacheGuardar(chave, cine);
+  }
+  a = malloc(sizeof(CatEp) * VIDEOS_MAX);
+  b = malloc(sizeof(CatEp) * VIDEOS_MAX);
+  if (a && b) {
+    int sa[CAT_TEMP_MAX] = {0}, sb[CAT_TEMP_MAX] = {0}, fora = 0;
+    ra = epsRegulares(corpoNuvio, a, &na);
+    rb = epsRegulares(cine, b, &nb);
+    // Per regular season counts; a season number past CAT_TEMP_MAX keeps
+    // the page as it is.
+    for (i = 0; i < na; i++)
+      if (a[i].temporada >= CAT_TEMP_MAX) fora = 1; else if (a[i].temporada > 0) sa[a[i].temporada]++;
+    for (i = 0; i < nb; i++)
+      if (b[i].temporada >= CAT_TEMP_MAX) fora = 1; else if (b[i].temporada > 0) sb[b[i].temporada]++;
+    troca = !fora && ra > 0 && rb >= ra && memcmp(sa, sb, sizeof sa) != 0;
+  }
+  free(a); free(b);
+  if (!troca) { free(cine); return NULL; }
+  printf("[desc] %s: Cinemeta divide as temporadas de outro jeito (%d contra %d episodios); "
+         "usando a lista do Cinemeta\n", titulo, rb, ra);
+  fflush(stdout);
+  publicarEpisodiosSubstituir(cine, alvoItem, titulo, corpoNuvio, DESC_MESCLA_VAZIOS, tp);
+  return cine;
+}
+
 // O Cinemeta as vezes conhece MENOS episodios que o addon de metadados do
 // usuario (#174: "Mis muertos tristes" tinha 1 de 4; #175: a serie so estava
 // completa noutra fonte). Pergunta o /meta/series de cada addon ativo que
@@ -8396,7 +8446,20 @@ static void *buscarEps(void *u) {
     // nCine publicado para em VIDEOS_MAX, e contra ele uma lista com os mesmos
     // episodios acima do teto "sabia mais" so por nao estar cortada.
     if (nCine >= VIDEOS_MAX) nCine = desc_meta_n_episodios(corpo);
-    epsDoAddon = episodiosDoAddon(alvoItem, serie, it->titulo, corpo, nCine, aplicar, &tp);
+    // Without a metadata add-on the page would keep the Nuvio catalog's split
+    // (TMDB), which for anime often differs from IMDb/TVDB, the numbering that
+    // Simkl, Trakt and the stream add-ons use. NuvioTV shows Cinemeta's list;
+    // so does this, when Cinemeta splits the seasons differently and knows at
+    // least as many regular episodes. The add-on step below then competes
+    // with that list, as its names always assumed.
+    char *cine = splitDoCinemeta(alvoItem, serie, it->titulo, corpo, &tp);
+    const char *corpoBase = cine ? cine : corpo;
+    if (cine) {
+      arte_reserva_episodios(serie, cine);
+      nCine = desc_meta_n_episodios(cine);
+    }
+    epsDoAddon = episodiosDoAddon(alvoItem, serie, it->titulo, corpoBase, nCine, aplicar, &tp);
+    free(cine);
   }
   // O MAPA DE EPISODIOS VISTOS NAO E PEDIDO AQUI, e essa linha existe para dizer
   // por que: extras.c JA baixa /shows/<id>/progress/watched ao abrir o titulo,
