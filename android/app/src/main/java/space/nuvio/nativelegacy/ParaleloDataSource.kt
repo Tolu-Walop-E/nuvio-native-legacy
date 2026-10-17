@@ -48,7 +48,11 @@ internal class FalhaDownloadParalelo(causa: IOException) : IOException(causa)
 class DestinosAddon(private val agora: () -> Long = { android.os.SystemClock.elapsedRealtime() }) {
     companion object {
         // O TorBox da ~3 h ao link do CDN; o resto do caminho cobre a sobra.
-        const val VALIDADE_MS = 2L * 60 * 60 * 1000
+        // So pesa numa abertura NOVA (seek, retomada, reconexao): a reproducao
+        // continua segue na conexao aberta e nunca pergunta o destino. 2,5 h
+        // como no .tpk (#567, comentario no #572); um link que venceu antes e
+        // recusado ou serve outro tamanho, e a abertura volta ao addon.
+        const val VALIDADE_MS = 150L * 60 * 1000
     }
     private var original: String? = null
     private var destino: URL? = null

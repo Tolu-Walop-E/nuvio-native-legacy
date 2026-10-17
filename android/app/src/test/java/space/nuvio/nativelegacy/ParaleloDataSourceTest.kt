@@ -471,6 +471,10 @@ class ParaleloDataSourceTest {
         val nova = { ParaleloDataSource(null, emptyMap(), destinos = destinos, novaConexao = rede::conexao,
             dormir = { throw AssertionError("nao deve esperar retry") }) }
         abrirDois(nova(), 0L)
+        // Dentro dos 2,5 h (um seek 2 h depois) o destino guardado ainda vale.
+        agora = 2L * 60 * 60 * 1000
+        abrirDois(nova(), 0L)
+        assertEquals(1, rede.noAddon.get())
         agora = DestinosAddon.VALIDADE_MS
         abrirDois(nova(), 0L)
         assertEquals(2, rede.noAddon.get())
