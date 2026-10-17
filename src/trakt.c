@@ -13,6 +13,7 @@
 #include "nuvem.h"
 #include "cwordem.h"
 #include "traktscrobble.h"
+#include "idbase.h"
 #include "traktult.h"
 #include "metaep.h"
 #include <stdio.h>
@@ -2438,6 +2439,10 @@ int trakt_scrobble_alvo(int evento, const TraktScrobbleAlvo *alvo, double posSeg
   const char *imdb = alvo ? alvo->id : NULL;
   if (!ligado || !imdb || !*imdb || !isfinite(posSeg) || !isfinite(durSeg) ||
       !isfinite(assistidoSeg) || durSeg < 120.0) return recusar(evento);
+  // The body names the title by IMDb id, or the episode by its TVDB id. Any
+  // other id ("kitsu:41370:1:5") came out as {"imdb":"kitsu"} with 41370 as
+  // the season: nothing goes instead.
+  if (alvo->tvdbEp <= 0 && !idbase_e_imdb(imdb)) return recusar(evento);
   // PARIDADE COM O NUVIOTV OFICIAL: o start exige reproducao continua (o player
   // so o pede depois de PLR_SCR_TOCOU_S), mas a SAIDA fala pela posicao, como
   // o flushPlaybackSnapshotForSwitchOrExit de la — inclusive depois de um seek.
